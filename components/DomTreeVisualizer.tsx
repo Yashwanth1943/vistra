@@ -73,6 +73,39 @@ export function DomTreeVisualizer({
     selectedRef.current?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   }, [selectedKey]);
 
+  const visibleNodes: DomTreeNode[] = [];
+  const collectVisible = (list: DomTreeNode[]) => {
+    for (const n of list) {
+      visibleNodes.push(n);
+      if (expandedKeys.has(pathKey(n.path)) && n.children.length > 0) {
+        collectVisible(n.children);
+      }
+    }
+  };
+  collectVisible(nodes);
+
+  const handleTreeKeyDown = (e: React.KeyboardEvent, node: DomTreeNode, isExpanded: boolean, hasBranch: boolean) => {
+    const key = pathKey(node.path);
+    const idx = visibleNodes.findIndex((n) => pathKey(n.path) === key);
+    if (e.key === 'ArrowDown' && idx >= 0 && idx < visibleNodes.length - 1) {
+      e.preventDefault();
+      onSelectNode(visibleNodes[idx + 1].path);
+    } else if (e.key === 'ArrowUp' && idx > 0) {
+      e.preventDefault();
+      onSelectNode(visibleNodes[idx - 1].path);
+    } else if (e.key === 'ArrowRight' && hasBranch && !isExpanded) {
+      e.preventDefault();
+      onToggleExpand(key);
+    } else if (e.key === 'ArrowLeft') {
+      e.preventDefault();
+      if (hasBranch && isExpanded) {
+        onToggleExpand(key);
+      } else if (node.path.length > 1) {
+        onSelectNode(node.path.slice(0, -1));
+      }
+    }
+  };
+
   const renderNode = (node: DomTreeNode, depth: number) => {
     const key = pathKey(node.path);
     const hasBranch = node.children.length > 0 || Boolean(node.textPreview);
@@ -105,9 +138,13 @@ export function DomTreeVisualizer({
           <button
             ref={isSelected ? selectedRef : null}
             type="button"
+            role="treeitem"
+            aria-selected={isSelected}
+            aria-expanded={hasBranch ? isExpanded : undefined}
             className="domv-node-btn"
             aria-current={isSelected ? 'true' : undefined}
             onClick={() => onSelectNode(node.path)}
+            onKeyDown={(e) => handleTreeKeyDown(e, node, isExpanded, hasBranch)}
           >
             <code className="domv-tag">&lt;{node.tag}&gt;</code>
             {node.id && <span className="domv-id">#{node.id}</span>}

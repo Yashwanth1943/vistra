@@ -41,16 +41,25 @@ type HomepageExperienceProps = {
   onSelectModule: (module: CurriculumModule) => void;
 };
 
-const labDirectory = [
-  { tab: 'HTML Playground', title: 'HTML Playground', desc: 'Toggle landmarks, forms, and tables to inspect the live DOM tree and browser render.', icon: Code2, accent: 'coral' },
-  { tab: 'CSS Playground', title: 'CSS Properties Explorer', desc: 'Search 14 CSS categories and adjust any property value on a live target.', icon: Sliders, accent: 'indigo' },
-  { tab: 'Flexbox lab', title: 'Flexbox Lab', desc: 'Control direction, wrap, justify-content, align-items, gaps, and item grow/shrink.', icon: Braces, accent: 'violet' },
-  { tab: 'Grid lab', title: 'Grid Lab', desc: 'Configure columns, rows, named areas, auto-flow, alignment, and cell spanning.', icon: MonitorPlay, accent: 'cyan' },
-  { tab: 'Positioning', title: 'Positioning Lab', desc: 'Compare static, relative, absolute, fixed, and sticky inside a scrollable stage.', icon: PanelsTopLeft, accent: 'amber' },
-  { tab: 'Box model', title: 'Box Model Lab', desc: 'Inspect content, padding, border, and margin layers with border-box vs content-box.', icon: Box, accent: 'mint' },
-  { tab: 'Responsive', title: 'Responsive Lab', desc: 'Resize viewport width and height to trigger @media (min-width) layout breakpoints.', icon: Smartphone, accent: 'indigo' },
-  { tab: 'Transform & Animation Lab', title: 'Transform & Animation Lab', desc: 'Experiment with translate, rotate, scale, transform-origin, transitions, and keyframes.', icon: Wand2, accent: 'violet' },
-  { tab: 'Playground', title: 'Code Playground', desc: 'Write full HTML and CSS in CodeMirror with live sandboxed preview and formatting.', icon: Layers, accent: 'cyan' },
+const labDirectory: {
+  tab: string;
+  title: string;
+  desc: string;
+  group: 'HTML' | 'CSS' | 'Visual Labs' | 'Developer Tools' | 'Workspace';
+  icon: typeof Code2;
+  accent: string;
+}[] = [
+  { tab: 'HTML Playground', title: 'HTML Playground', desc: 'Inspect the live DOM tree, edit attributes and nodes, and watch browser rendering update.', group: 'HTML', icon: Code2, accent: 'coral' },
+  { tab: 'CSS Playground', title: 'CSS Playground', desc: 'Explore CSS properties, sizing & overflow, CSS units, pseudo-elements, and cascade rules.', group: 'CSS', icon: Sliders, accent: 'indigo' },
+  { tab: 'Flexbox lab', title: 'Flexbox', desc: 'Control direction, wrap, justify-content, align-items, gaps, and item grow/shrink.', group: 'Visual Labs', icon: Braces, accent: 'violet' },
+  { tab: 'Grid lab', title: 'Grid', desc: 'Configure columns, rows, named areas, minmax(0, 1fr), and cell spanning.', group: 'Visual Labs', icon: MonitorPlay, accent: 'cyan' },
+  { tab: 'Positioning', title: 'Positioning & Stacking', desc: 'Compare static, relative, absolute, fixed, sticky, and nested stacking contexts.', group: 'Visual Labs', icon: PanelsTopLeft, accent: 'amber' },
+  { tab: 'Box model', title: 'Box Model', desc: 'Inspect content, padding, border, and margin layers with border-box vs content-box.', group: 'Visual Labs', icon: Box, accent: 'mint' },
+  { tab: 'Responsive', title: 'Responsive Design', desc: 'Resize viewport width and height to trigger @media queries and detect overflow.', group: 'Visual Labs', icon: Smartphone, accent: 'indigo' },
+  { tab: 'Transform & Animation Lab', title: 'Transform & Animation', desc: 'Experiment with 2D transforms, keyframes, and the browser rendering pipeline.', group: 'Visual Labs', icon: Wand2, accent: 'violet' },
+  { tab: 'Playground', title: 'Code Playground', desc: 'Write full HTML and CSS in CodeMirror with live sandboxed preview and formatting.', group: 'Developer Tools', icon: Layers, accent: 'cyan' },
+  { tab: 'Visual Debugger', title: 'CSS Visual Debugger', desc: 'Inspect computed styles, box layers, cascade specificity, and stacking triggers.', group: 'Developer Tools', icon: Sparkles, accent: 'indigo' },
+  { tab: 'Saved Experiments', title: 'Saved Experiments', desc: 'Resume your active Code Playground draft, saved experiments, and bookmarked concepts.', group: 'Workspace', icon: BookOpen, accent: 'mint' },
 ];
 
 export function HomepageExperience({
@@ -67,6 +76,7 @@ export function HomepageExperience({
   const [gridCols, setGridCols] = useState('repeat(3, 1fr)');
   const [boxPad, setBoxPad] = useState(20);
   const [boxSizing, setBoxSizing] = useState<'border-box' | 'content-box'>('border-box');
+  const [labFilter, setLabFilter] = useState<'All' | 'HTML' | 'CSS' | 'Visual Labs' | 'Developer Tools' | 'Workspace'>('All');
 
   const resetHero = () => {
     setJustify('space-between');
@@ -348,31 +358,47 @@ export function HomepageExperience({
           <div className="viz-section-head">
             <div>
               <span className="section-kicker">INTERACTIVE LABORATORIES</span>
-              <h2>Pick a CSS or HTML lab to experiment directly</h2>
+              <h2>Pick a lab to experiment directly</h2>
             </div>
-            <button type="button" className="subtle-link" onClick={() => onNavigate('Playground')}>
-              Open Code Playground <ArrowRight size={14} />
-            </button>
+            <div className="learn-group-pills" role="tablist" aria-label="Filter labs by category">
+              {(['All', 'HTML', 'CSS', 'Visual Labs', 'Developer Tools', 'Workspace'] as const).map((cat) => (
+                <button
+                  key={cat}
+                  type="button"
+                  role="tab"
+                  aria-selected={labFilter === cat}
+                  className={labFilter === cat ? 'active' : ''}
+                  onClick={() => setLabFilter(cat)}
+                >
+                  {cat}
+                </button>
+              ))}
+            </div>
           </div>
 
           <div className="viz-lab-grid">
-            {labDirectory.map((lab) => (
-              <button
-                key={lab.tab}
-                type="button"
-                className={`viz-lab-card accent-${lab.accent}`}
-                onClick={() => onNavigate(lab.tab)}
-              >
-                <div className="viz-lab-icon">
-                  <lab.icon size={18} />
-                </div>
-                <strong>{lab.title}</strong>
-                <p>{lab.desc}</p>
-                <span>
-                  Launch lab <ArrowRight size={13} />
-                </span>
-              </button>
-            ))}
+            {labDirectory
+              .filter((lab) => labFilter === 'All' || lab.group === labFilter)
+              .map((lab) => (
+                <button
+                  key={lab.tab}
+                  type="button"
+                  className={`viz-lab-card accent-${lab.accent}`}
+                  onClick={() => onNavigate(lab.tab)}
+                >
+                  <div className="viz-lab-card-top">
+                    <div className="viz-lab-icon">
+                      <lab.icon size={18} />
+                    </div>
+                    <span className="viz-lab-group-tag">{lab.group}</span>
+                  </div>
+                  <strong>{lab.title}</strong>
+                  <p>{lab.desc}</p>
+                  <span>
+                    Launch lab <ArrowRight size={13} />
+                  </span>
+                </button>
+              ))}
           </div>
         </section>
 

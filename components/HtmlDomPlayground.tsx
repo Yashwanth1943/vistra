@@ -121,10 +121,16 @@ export function HtmlDomPlayground({ onOpenCodePlayground }: { onOpenCodePlaygrou
   const [newChildTag, setNewChildTag] = useState('p');
   const [newChildText, setNewChildText] = useState('');
   const [copiedHtml, setCopiedHtml] = useState(false);
+  const [liveStatus, setLiveStatus] = useState('');
 
   const iframeRef = useRef<HTMLIFrameElement>(null);
+  const wrapRef = useRef<HTMLDivElement>(null);
   const inspectModeRef = useRef(inspectMode);
   inspectModeRef.current = inspectMode;
+  const selectedPathRef = useRef(selectedPath);
+  selectedPathRef.current = selectedPath;
+  const cleanupObserversRef = useRef<(() => void) | null>(null);
+  const rafMeasureRef = useRef<number | null>(null);
 
   const htmlWarning = useMemo(() => validateHtml(html), [html]);
   const previewDoc = useMemo(
@@ -142,16 +148,49 @@ export function HtmlDomPlayground({ onOpenCodePlayground }: { onOpenCodePlaygrou
     });
   }, []);
 
+  const measureHighlight = useCallback(() => {
+    const iframe = iframeRef.current;
+    const wrap = wrapRef.current;
+    const doc = iframe?.contentDocument;
+    if (!iframe || !wrap || !doc || !doc.body) return;
+
+    const target = getElementByPath(doc.body, selectedPathRef.current) ?? doc.body.firstElementChild;
+    if (!target) {
+      setHighlightRect(null);
+      return;
+    }
+
+    const tRect = target.getBoundingClientRect();
+    const iRect = iframe.getBoundingClientRect();
+    const wRect = wrap.getBoundingClientRect();
+
+    setHighlightRect({
+      top: Math.round(iRect.top - wRect.top + tRect.top),
+      left: Math.round(iRect.left - wRect.left + tRect.left),
+      width: Math.round(tRect.width),
+      height: Math.round(tRect.height),
+    });
+  }, []);
+
+  const scheduleMeasure = useCallback(() => {
+    if (rafMeasureRef.current !== null) return;
+    rafMeasureRef.current = window.requestAnimationFrame(() => {
+      rafMeasureRef.current = null;
+      measureHighlight();
+    });
+  }, [measureHighlight]);
+
   const syncFromIframe = useCallback(
     (scrollPreviewTarget: boolean) => {
       const iframe = iframeRef.current;
+      const wrap = wrapRef.current;
       const doc = iframe?.contentDocument;
-      if (!doc || !doc.body) return;
+      if (!iframe || !wrap || !doc || !doc.body) return;
 
       const tree = buildDomTreeFromElement(doc.body);
       setDomTree(tree);
 
-      const target = getElementByPath(doc.body, selectedPath) ?? doc.body.firstElementChild;
+      const target = getElementByPath(doc.body, selectedPathRef.current) ?? doc.body.firstElementChild;
       if (!target) {
         setInspected(null);
         setHighlightRect(null);
@@ -160,15 +199,17 @@ export function HtmlDomPlayground({ onOpenCodePlayground }: { onOpenCodePlaygrou
 
       const resolvedPath = getPathForElement(doc.body, target);
       if (scrollPreviewTarget) {
-        target.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'smooth' });
+        target.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'auto' });
       }
 
-      const r = target.getBoundingClientRect();
+      const tRect = target.getBoundingClientRect();
+      const iRect = iframe.getBoundingClientRect();
+      const wRect = wrap.getBoundingClientRect();
       setHighlightRect({
-        top: Math.round(r.top),
-        left: Math.round(r.left),
-        width: Math.round(r.width),
-        height: Math.round(r.height),
+        top: Math.round(iRect.top - wRect.top + tRect.top),
+        left: Math.round(iRect.left - wRect.left + tRect.left),
+        width: Math.round(tRect.width),
+        height: Math.round(tRect.height),
       });
 
       const parent = target.parentElement;
@@ -193,8 +234,8 @@ export function HtmlDomPlayground({ onOpenCodePlayground }: { onOpenCodePlaygrou
           label: `<${c.tagName.toLowerCase()}>${c.id ? `#${c.id}` : c.classList[0] ? `.${c.classList[0]}` : ''}`,
           path: [...resolvedPath, idx],
         })),
-        width: Math.round(r.width),
-        height: Math.round(r.height),
+        width: Math.round(tRect.width),
+        height: Math.round(tRect.height),
         textContent: directText,
         canMoveUp: Boolean(target.previousElementSibling),
         canMoveDown: Boolean(target.nextElementSibling),
@@ -204,13 +245,18 @@ export function HtmlDomPlayground({ onOpenCodePlayground }: { onOpenCodePlaygrou
       setTextDraft(directText);
       setClassDraft(info.classes.join(' '));
     },
-    [selectedPath]
+    []
   );
 
   const handleIframeLoad = useCallback(() => {
+    cleanupObserversRef.current?.();
+    cleanupObserversRef.current = null;
+
     const iframe = iframeRef.current;
+    const wrap = wrapRef.current;
     const doc = iframe?.contentDocument;
-    if (!doc || !doc.body) return;
+    const win = iframe?.contentWindow;
+    if (!iframe || !doc || !doc.body || !win) return;
 
     const onClick = (event: MouseEvent) => {
       if (!inspectModeRef.current) return;
@@ -221,14 +267,67 @@ export function HtmlDomPlayground({ onOpenCodePlayground }: { onOpenCodePlaygrou
       const path = getPathForElement(doc.body, target);
       if (path.length > 0) {
         expandAncestors(path);
+        selectedPathRef.current = path;
         setSelectedPath(path);
+        syncFromIframe(false);
       }
     };
 
     doc.body.style.cursor = inspectModeRef.current ? 'pointer' : 'auto';
     doc.body.addEventListener('click', onClick);
+    win.addEventListener('scroll', scheduleMeasure, { passive: true });
+    doc.addEventListener('scroll', scheduleMeasure, { passive: true, capture: true });
+    doc.addEventListener('load', scheduleMeasure, true);
+    window.addEventListener('scroll', scheduleMeasure, { passive: true });
+    window.addEventListener('resize', scheduleMeasure, { passive: true });
+
+    const resizeObs =
+      typeof ResizeObserver !== 'undefined'
+        ? new ResizeObserver(() => scheduleMeasure())
+        : null;
+    if (resizeObs) {
+      if (wrap) resizeObs.observe(wrap);
+      resizeObs.observe(iframe);
+      resizeObs.observe(doc.body);
+      for (const child of Array.from(doc.body.children)) {
+        resizeObs.observe(child);
+      }
+    }
+
+    const mutationObs =
+      typeof MutationObserver !== 'undefined'
+        ? new MutationObserver(() => syncFromIframe(false))
+        : null;
+    mutationObs?.observe(doc.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      characterData: true,
+    });
+
+    cleanupObserversRef.current = () => {
+      doc.body?.removeEventListener('click', onClick);
+      win.removeEventListener('scroll', scheduleMeasure);
+      doc.removeEventListener('scroll', scheduleMeasure, true);
+      doc.removeEventListener('load', scheduleMeasure, true);
+      window.removeEventListener('scroll', scheduleMeasure);
+      window.removeEventListener('resize', scheduleMeasure);
+      resizeObs?.disconnect();
+      mutationObs?.disconnect();
+    };
+
     syncFromIframe(false);
-  }, [expandAncestors, syncFromIframe]);
+  }, [expandAncestors, scheduleMeasure, syncFromIframe]);
+
+  useEffect(
+    () => () => {
+      cleanupObserversRef.current?.();
+      if (rafMeasureRef.current !== null) {
+        window.cancelAnimationFrame(rafMeasureRef.current);
+      }
+    },
+    []
+  );
 
   useEffect(() => {
     const doc = iframeRef.current?.contentDocument;
@@ -283,11 +382,12 @@ export function HtmlDomPlayground({ onOpenCodePlayground }: { onOpenCodePlaygrou
     });
   };
 
-  const applyDomResult = (res: { html: string; nextPath: number[] } | null) => {
+  const applyDomResult = (res: { html: string; nextPath: number[] } | null, announcement?: string) => {
     if (!res) return;
     setHtml(res.html);
     expandAncestors(res.nextPath);
     setSelectedPath(res.nextPath);
+    if (announcement) setLiveStatus(announcement);
   };
 
   const copyHtml = async () => {
@@ -458,7 +558,7 @@ export function HtmlDomPlayground({ onOpenCodePlayground }: { onOpenCodePlaygrou
               {inspectMode ? 'Inspect on click: ON' : 'Inspect on click: OFF'}
             </button>
           </div>
-          <div className="domv-iframe-wrap">
+          <div ref={wrapRef} className="domv-iframe-wrap">
             <iframe
               ref={iframeRef}
               title="HTML Playground live preview"
@@ -468,7 +568,7 @@ export function HtmlDomPlayground({ onOpenCodePlayground }: { onOpenCodePlaygrou
             />
             {highlightRect && highlightRect.width > 0 && (
               <div
-                className="domv-highlight-box"
+                className={`domv-highlight-box ${highlightRect.top < 20 ? 'label-inside' : ''}`}
                 aria-hidden="true"
                 style={{
                   top: highlightRect.top,
@@ -527,7 +627,7 @@ export function HtmlDomPlayground({ onOpenCodePlayground }: { onOpenCodePlaygrou
                     type="button"
                     aria-label="Remove selected element"
                     className="danger"
-                    onClick={() => applyDomResult(removeElementAtPath(html, inspected.path))}
+                    onClick={() => applyDomResult(removeElementAtPath(html, inspected.path), `Removed <${inspected.tag}> element`)}
                   >
                     <Trash2 size={13} />
                   </button>
@@ -669,7 +769,8 @@ export function HtmlDomPlayground({ onOpenCodePlayground }: { onOpenCodePlaygrou
                 onSubmit={(e) => {
                   e.preventDefault();
                   applyDomResult(
-                    addChildElement(html, inspected.path, newChildTag, newChildText)
+                    addChildElement(html, inspected.path, newChildTag, newChildText),
+                    `Added <${newChildTag}> child element`
                   );
                   setNewChildText('');
                 }}
@@ -706,6 +807,9 @@ export function HtmlDomPlayground({ onOpenCodePlayground }: { onOpenCodePlaygrou
       </div>
 
       {/* Live HTML Editor synchronized with DOM Tree & Preview */}
+      <div className="sr-only" role="status" aria-live="polite">
+        {liveStatus || (inspected ? `Selected <${inspected.tag}>${inspected.id ? `#${inspected.id}` : ''}` : '')}
+      </div>
       <div className="live-exp-shell">
         <div className="live-exp-toolbar">
           <div className="live-exp-pane-head" style={{ border: 0, padding: 0, background: 'transparent' }}>

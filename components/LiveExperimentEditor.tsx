@@ -109,6 +109,8 @@ export function LiveExperimentEditor({
               className={viewport === 'desktop' ? 'active' : ''}
               onClick={() => setViewport('desktop')}
               title="Desktop preview"
+              aria-label="Desktop preview"
+              aria-pressed={viewport === 'desktop'}
             >
               <Monitor size={13} />
             </button>
@@ -117,6 +119,8 @@ export function LiveExperimentEditor({
               className={viewport === 'tablet' ? 'active' : ''}
               onClick={() => setViewport('tablet')}
               title="Tablet preview (768px)"
+              aria-label="Tablet preview (768px)"
+              aria-pressed={viewport === 'tablet'}
             >
               <Tablet size={13} />
             </button>
@@ -125,6 +129,8 @@ export function LiveExperimentEditor({
               className={viewport === 'mobile' ? 'active' : ''}
               onClick={() => setViewport('mobile')}
               title="Mobile preview (375px)"
+              aria-label="Mobile preview (375px)"
+              aria-pressed={viewport === 'mobile'}
             >
               <Smartphone size={13} />
             </button>

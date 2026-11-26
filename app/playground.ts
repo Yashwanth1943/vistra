@@ -66,7 +66,7 @@ export function validateCss(css: string): string | null {
 }
 
 export function validateHtml(markup: string): string | null {
-  const voidElements = new Set(['area','base','br','col','embed','hr','img','input','link','meta','param','source','track','wbr']);
+  const voidElements = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr']);
   const cleaned = markup.replace(/<!--[\s\S]*?-->/g, '').replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, '').replace(/<style\b[^>]*>[\s\S]*?<\/style\s*>/gi, '');
   const stack: string[] = [];
   for (const match of cleaned.matchAll(/<(\/)?([a-z][\w:-]*)\b[^>]*>/gi)) {

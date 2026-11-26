@@ -25,6 +25,7 @@ export function SegmentedControl({
           <button
             key={option}
             type="button"
+            aria-pressed={value === option}
             className={value === option ? 'active' : ''}
             onClick={() => onChange(option)}
           >
@@ -255,6 +256,7 @@ export function LabHeader({
               <button
                 key={p.id}
                 type="button"
+                aria-pressed={activePreset === p.id}
                 className={`viz-preset-btn ${activePreset === p.id ? 'active' : ''}`}
                 onClick={() => onPreset(p.id)}
               >

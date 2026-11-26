@@ -64,6 +64,27 @@ export default function Home() {
   const [recent, setRecent] = useState<string[]>([]);
   const topbarSearchRef = useRef<HTMLInputElement>(null);
   const learnSearchRef = useRef<HTMLInputElement>(null);
+  const menuToggleRef = useRef<HTMLButtonElement>(null);
+  const feedbackBtnRef = useRef<HTMLButtonElement>(null);
+  const helpBtnRef = useRef<HTMLButtonElement>(null);
+  const helpCloseRef = useRef<HTMLButtonElement>(null);
+  const helpCardRef = useRef<HTMLDivElement>(null);
+  const trapModalTab = (e: React.KeyboardEvent, container: HTMLElement | null) => {
+    if (e.key !== 'Tab' || !container) return;
+    const focusables = Array.from(
+      container.querySelectorAll<HTMLElement>('button:not(:disabled), [href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])')
+    );
+    if (focusables.length === 0) return;
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  };
   useEffect(() => { try { const savedFavorites = normalizeSavedIds(JSON.parse(localStorage.getItem('webcraft:favorites') || '[]')); const savedRecent = normalizeSavedIds(JSON.parse(localStorage.getItem('webcraft:recent') || '[]')).slice(0, 6); setFavorites(savedFavorites); setRecent(savedRecent); persistBrowserState('webcraft:favorites',savedFavorites); persistBrowserState('webcraft:recent',savedRecent); } catch { /* Ignore invalid saved browser data. */ } }, []);
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -74,11 +95,24 @@ export default function Home() {
           target.focus();
           target.select();
         }
+      } else if (event.key === 'Escape') {
+        if (showHelp) {
+          setShowHelp(false);
+          window.requestAnimationFrame(() => helpBtnRef.current?.focus());
+        } else if (showMobileNav) {
+          setShowMobileNav(false);
+          window.requestAnimationFrame(() => menuToggleRef.current?.focus());
+        }
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [activeTab]);
+  }, [activeTab, showHelp, showMobileNav]);
+  useEffect(() => {
+    if (showHelp) {
+      helpCloseRef.current?.focus();
+    }
+  }, [showHelp]);
   const lesson = lessons.find(l => l.id === activeLesson) ?? lessons[0];
   const filteredLessons = useMemo(() => lessons.filter(l => `${l.title} ${l.group} ${l.description}`.toLowerCase().includes(query.toLowerCase())), [query]);
   const exploreNav = [
@@ -104,6 +138,8 @@ export default function Home() {
     {name:'Recent Activity',label:'Recent Activity',icon:Clock},
   ];
   const hiddenNav = [{name:'Compare',label:'Compare',icon:PanelsTopLeft},{name:'Predict',label:'Predict',icon:Sparkles},{name:'Examples',label:'Examples',icon:Hammer},{name:'Build & Experiment',label:'Build & Experiment',icon:Hammer},{name:'Practice',label:'Practice Studio',icon:Sparkles}];
+  const allNavItems = [...exploreNav, ...labNav, ...toolsNav, ...workspaceNav, ...hiddenNav];
+  const activeTabLabel = allNavItems.find(item => item.name === activeTab)?.label ?? activeTab;
   useEffect(() => {
     trackLabVisit(activeTab);
   }, [activeTab]);
@@ -137,7 +173,7 @@ export default function Home() {
     </aside>
     {showMobileNav&&<button className="scrim" onClick={()=>setShowMobileNav(false)} aria-label="Close navigation"/>}
     <main id="main-content" tabIndex={-1} className="main-area">
-      <header className="topbar"><div className="topbar-left"><button className="menu-toggle" onClick={()=>setShowMobileNav(true)} aria-label="Open menu"><Menu size={20}/></button><button className="breadcrumb" onClick={()=>setActiveTab('Overview')}>Explore</button><label className="global-search"><Search size={14}/><input ref={topbarSearchRef} value={query} onFocus={()=>setActiveTab('Learn')} onChange={e=>{setQuery(e.target.value);setActiveTab('Learn')}} placeholder="Search concepts" aria-label="Search concepts"/><kbd>⌘ K</kbd></label><ChevronRight size={14}/><span className="breadcrumb-current">{activeTab}</span></div><div className="topbar-right"><button type="button" className="reset-button" onClick={()=>setShowFeedback(true)} aria-label="Send lab feedback"><MessageSquare size={13}/><span>Feedback</span></button><div className="streak"><Zap size={15}/><span>Keep learning</span></div><button className="help-button" onClick={()=>setShowHelp(true)} title="Keyboard shortcuts and help" aria-label="Keyboard shortcuts and help"><CircleHelp size={18}/></button><div className="user-avatar" aria-hidden="true">Y</div></div></header>
+      <header className="topbar"><div className="topbar-left"><button ref={menuToggleRef} className="menu-toggle" onClick={()=>setShowMobileNav(true)} aria-label="Open menu" aria-expanded={showMobileNav}><Menu size={20}/></button><button className="breadcrumb" onClick={()=>setActiveTab('Overview')}>Explore</button><label className="global-search"><Search size={14}/><input ref={topbarSearchRef} value={query} onFocus={()=>setActiveTab('Learn')} onChange={e=>{setQuery(e.target.value);setActiveTab('Learn')}} placeholder="Search concepts" aria-label="Search concepts"/><kbd>⌘ K</kbd></label><ChevronRight size={14}/><span className="breadcrumb-current">{activeTabLabel}</span></div><div className="topbar-right"><button ref={feedbackBtnRef} type="button" className="reset-button" onClick={()=>setShowFeedback(true)} aria-label="Send lab feedback"><MessageSquare size={13}/><span>Feedback</span></button><div className="streak"><Zap size={15}/><span>Keep learning</span></div><button ref={helpBtnRef} className="help-button" onClick={()=>setShowHelp(true)} title="Keyboard shortcuts and help" aria-label="Keyboard shortcuts and help" aria-expanded={showHelp}><CircleHelp size={18}/></button><div className="user-avatar" aria-hidden="true">Y</div></div></header>
       <div className="content-wrap">
         {activeTab==='HTML Playground'?<HtmlPlaygroundLab onOpenCodePlayground={()=>setActiveTab('Playground')}/>:null}
         {activeTab==='CSS Playground'?<CssPropertiesExplorer/>:null}
@@ -167,7 +203,7 @@ export default function Home() {
       </div>
       <footer className="footer"><span>Made for curious minds.</span><span>WebCraft Academy <span className="footer-dot">·</span> Learn by building</span></footer>
     </main>
-    {showFeedback&&<FeedbackModal activeLab={activeTab} onClose={()=>setShowFeedback(false)}/>}
-    {showHelp&&<div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="help-modal-title"><div className="modal-card"><div className="modal-head"><h2 id="help-modal-title"><CircleHelp size={16}/> Keyboard Shortcuts</h2><button type="button" className="ws-icon-btn" onClick={()=>setShowHelp(false)} aria-label="Close help dialog"><X size={16}/></button></div><div className="modal-shortcuts"><div><kbd>Ctrl / ⌘ + K</kbd><span>Focus concept search</span></div><div><kbd>Ctrl / ⌘ + Enter</kbd><span>Run preview</span></div><div><kbd>Shift + Alt + F</kbd><span>Format HTML &amp; CSS</span></div><div><kbd>Ctrl / ⌘ + S</kbd><span>Save or export</span></div><div><kbd>Ctrl + M</kbd><span>Switch editor pane</span></div></div><div className="modal-actions"><button type="button" className="primary-button" onClick={()=>setShowHelp(false)}>Got it</button></div></div></div>}
+    {showFeedback&&<FeedbackModal activeLab={activeTab} onClose={()=>{setShowFeedback(false);window.requestAnimationFrame(()=>feedbackBtnRef.current?.focus());}}/>}
+    {showHelp&&<div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="help-modal-title"><div ref={helpCardRef} onKeyDown={(e)=>trapModalTab(e,helpCardRef.current)} className="modal-card"><div className="modal-head"><h2 id="help-modal-title"><CircleHelp size={16}/> Keyboard Shortcuts</h2><button ref={helpCloseRef} type="button" className="ws-icon-btn" onClick={()=>{setShowHelp(false);window.requestAnimationFrame(()=>helpBtnRef.current?.focus());}} aria-label="Close help dialog"><X size={16}/></button></div><div className="modal-shortcuts"><div><kbd>Ctrl / ⌘ + K</kbd><span>Focus concept search</span></div><div><kbd>Ctrl / ⌘ + Enter</kbd><span>Run preview</span></div><div><kbd>Shift + Alt + F</kbd><span>Format HTML &amp; CSS</span></div><div><kbd>Ctrl / ⌘ + S</kbd><span>Save or export</span></div><div><kbd>Ctrl + M</kbd><span>Switch editor pane</span></div><div><kbd>Esc</kbd><span>Close dialog or menu</span></div></div><div className="modal-actions"><button type="button" className="primary-button" onClick={()=>{setShowHelp(false);window.requestAnimationFrame(()=>helpBtnRef.current?.focus());}}>Got it</button></div></div></div>}
   </div>;
 }
