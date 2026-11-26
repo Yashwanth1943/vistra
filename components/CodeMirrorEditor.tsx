@@ -110,6 +110,7 @@ export function CodeMirrorEditor({
 }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
+  const isExternalUpdateRef = useRef(false);
   const callbacksRef = useRef({ onChange, onFocus, onRun, onSave, onFormat, onNextPane });
   callbacksRef.current = { onChange, onFocus, onRun, onSave, onFormat, onNextPane };
 
@@ -179,7 +180,7 @@ export function CodeMirrorEditor({
           if (update.focusChanged && update.view.hasFocus) {
             callbacksRef.current.onFocus();
           }
-          if (update.docChanged) {
+          if (update.docChanged && !isExternalUpdateRef.current) {
             callbacksRef.current.onChange(update.state.doc.toString());
           }
         }),
@@ -204,10 +205,12 @@ export function CodeMirrorEditor({
     if (current !== value) {
       const prevHead = view.state.selection.main.head;
       const safeHead = Math.min(prevHead, value.length);
+      isExternalUpdateRef.current = true;
       view.dispatch({
         changes: { from: 0, to: current.length, insert: value },
         selection: { anchor: safeHead },
       });
+      isExternalUpdateRef.current = false;
     }
   }, [value]);
 
