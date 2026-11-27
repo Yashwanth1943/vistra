@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <defs>
+    <linearGradient id="vistra-left" x1="8" y1="10" x2="34" y2="54" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#6D28D9" />
+      <stop offset="65%" stop-color="#5B21B6" />
+      <stop offset="100%" stop-color="#431693" />
+    </linearGradient>
+    <linearGradient id="vistra-right" x1="25" y1="54" x2="56" y2="10" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#7C3AED" />
+      <stop offset="52%" stop-color="#9B7AF7" />
+      <stop offset="100%" stop-color="#C4B5FD" />
+    </linearGradient>
+  </defs>
+  <!-- Left descending arm -->
+  <path d="M8.5 11.5C7.9 10.5 8.6 9.5 9.8 9.5H20.4C21.6 9.5 22.7 10.1 23.3 11.1L36.2 33.4L29.6 45.2C27.9 48.2 24.4 48.2 22.7 45.2L8.5 11.5Z" fill="url(#vistra-left)" />
+  <!-- Right ascending arm overlapping smoothly at the vertex -->
+  <path d="M23.5 46.8C25.2 49.8 27.9 53.5 32 53.5C36.1 53.5 38.8 50.1 40.5 47.1L55.5 11.5C56.1 10.5 55.4 9.5 54.2 9.5H43.6C42.4 9.5 41.3 10.1 40.7 11.1L27.1 35.1C25.3 38.3 24.2 42.9 23.5 46.8Z" fill="url(#vistra-right)" />
+</svg>

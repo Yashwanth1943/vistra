@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500;600;700&family=Sora:wght@500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap');
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -21,6 +21,9 @@
   --border-mid: #323b57;
 
   /* Brand & Studio Accents */
+  --brand-purple: #6d28d9;
+  --brand-lavender: #a78bfa;
+  --brand-graphite: #0f0f1a;
   --violet: #7c5cff;
   --violet-ink: #5b3df5;
   --violet-bright: #9b82ff;
@@ -135,35 +138,36 @@ kbd {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 2px 6px 8px;
-  color: var(--ink);
+  padding: 4px 6px 10px;
+  color: var(--brand-graphite);
 }
 
-.brand-logo {
-  display: block;
-  height: 42px;
-  width: auto;
-  max-width: 100%;
-  object-fit: contain;
-  flex-shrink: 1;
-}
-
-.brand-mark {
-  height: 28px;
-  width: 28px;
+.brand-button {
+  display: inline-flex;
+  align-items: center;
+  border: 0;
+  background: transparent;
+  padding: 2px;
   border-radius: 8px;
-  background: linear-gradient(135deg, var(--violet) 0%, var(--cobalt) 100%);
-  color: #fff;
-  display: grid;
-  place-items: center;
-  flex-shrink: 0;
-  box-shadow: 0 4px 12px rgba(124, 92, 255, 0.24);
+  cursor: pointer;
 }
 
-.brand-light {
-  font-weight: 500;
-  color: var(--muted);
-  margin-left: 2px;
+.vistra-logo {
+  display: block;
+  height: auto;
+  max-width: 100%;
+  flex-shrink: 0;
+}
+
+.mobile-brand-button {
+  display: none;
+  align-items: center;
+  border: 0;
+  background: transparent;
+  padding: 2px 4px;
+  border-radius: 8px;
+  cursor: pointer;
+  flex-shrink: 0;
 }
 
 .sidebar-section-label {
@@ -265,6 +269,11 @@ kbd {
   font-weight: 700;
   font-size: 11px;
   flex-shrink: 0;
+}
+
+.mentor-avatar--vistra {
+  background: #f3f0ff;
+  border: 1px solid rgba(109, 40, 217, 0.16);
 }
 
 .sidebar-bottom-info {
@@ -3016,8 +3025,8 @@ kbd {
     transform: translateX(0);
   }
 
-  .brand-logo {
-    height: 38px;
+  .mobile-brand-button {
+    display: inline-flex;
   }
 
   .mobile-close {

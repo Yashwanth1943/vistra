@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 212 52" fill="none">
+  <defs>
+    <linearGradient id="vistra-logo-left" x1="4" y1="6" x2="28" y2="46" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#6D28D9" />
+      <stop offset="65%" stop-color="#5B21B6" />
+      <stop offset="100%" stop-color="#431693" />
+    </linearGradient>
+    <linearGradient id="vistra-logo-right" x1="20" y1="46" x2="48" y2="6" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#7C3AED" />
+      <stop offset="52%" stop-color="#9B7AF7" />
+      <stop offset="100%" stop-color="#C4B5FD" />
+    </linearGradient>
+  </defs>
+  <!-- Geometric V symbol -->
+  <path d="M4.5 8.5C3.9 7.6 4.6 6.5 5.8 6.5H15.4C16.5 6.5 17.5 7.1 18.1 8.1L29.6 28.2L23.6 38.9C22.1 41.6 18.9 41.6 17.4 38.9L4.5 8.5Z" fill="url(#vistra-logo-left)" />
+  <path d="M18.1 40.3C19.6 43 22.1 46.5 25.8 46.5C29.5 46.5 32 43.3 33.5 40.6L47.1 8.5C47.7 7.6 47 6.5 45.8 6.5H36.2C35.1 6.5 34.1 7.1 33.5 8.1L21.3 29.8C19.7 32.7 18.7 36.8 18.1 40.3Z" fill="url(#vistra-logo-right)" />
+  <!-- Vistra wordmark -->
+  <text x="58" y="38" fill="#0F0F1A" font-family="Sora, Poppins, system-ui, -apple-system, sans-serif" font-size="34" font-weight="600" letter-spacing="-0.8">Vistra</text>
+  <!-- Sparkle accent -->
+  <path d="M192 4L194.2 10.8L201 13L194.2 15.2L192 22L189.8 15.2L183 13L189.8 10.8L192 4Z" fill="#6D28D9" />
+</svg>
