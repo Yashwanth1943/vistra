@@ -1,0 +1,22 @@
+import { NextResponse } from 'next/server';
+import { getServerSession } from '@/lib/auth/session';
+
+export async function GET() {
+  const session = await getServerSession();
+  if (!session) {
+    return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 });
+  }
+
+  return NextResponse.json(
+    {
+      ok: true,
+      workspace: {
+        userId: session.user.id,
+        name: session.user.name,
+        email: session.user.email,
+        role: session.user.role,
+      },
+    },
+    { status: 200 },
+  );
+}
