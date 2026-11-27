@@ -40,6 +40,35 @@ export async function getServerSession(): Promise<ValidatedSession | null> {
   return validateSessionToken(rawToken);
 }
 
+export type ServerSessionResult =
+  | { status: 'authenticated'; session: ValidatedSession }
+  | { status: 'unauthenticated' }
+  | { status: 'unavailable' };
+
+/**
+ * Fail-closed session reader for Server Components.
+ * Never treats a database/config error as authenticated, and distinguishes outages
+ * from ordinary unauthenticated state while logging only sanitized metadata.
+ */
+export async function getServerSessionResult(): Promise<ServerSessionResult> {
+  try {
+    const session = await getServerSession();
+    if (!session) {
+      return { status: 'unauthenticated' };
+    }
+    return { status: 'authenticated', session };
+  } catch (error) {
+    console.error('[auth:session]', {
+      name: error instanceof Error ? error.name : 'UnknownError',
+      code:
+        typeof error === 'object' && error !== null && 'code' in error
+          ? String((error as { code?: unknown }).code)
+          : undefined,
+    });
+    return { status: 'unavailable' };
+  }
+}
+
 export async function destroyServerSession(): Promise<void> {
   const cookieStore = await cookies();
   const rawToken = cookieStore.get(SESSION_COOKIE_NAME)?.value;

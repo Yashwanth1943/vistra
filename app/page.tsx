@@ -1,22 +1,29 @@
 import { redirect } from 'next/navigation';
-import { getServerSession } from '@/lib/auth/session';
+import { getServerSessionResult } from '@/lib/auth/session';
 import { VistraAppShell } from '@/components/VistraAppShell';
 
 export const dynamic = 'force-dynamic';
 
 export default async function HomePage() {
-  const session = await getServerSession();
-  if (!session) {
+  const result = await getServerSessionResult();
+  if (result.status === 'unavailable') {
+    redirect(
+      `/auth/error?message=${encodeURIComponent(
+        'Authentication service is temporarily unavailable. Please try again shortly.',
+      )}`,
+    );
+  }
+  if (result.status !== 'authenticated') {
     redirect('/login');
   }
 
   return (
     <VistraAppShell
       currentUser={{
-        id: session.user.id,
-        name: session.user.name,
-        email: session.user.email,
-        role: session.user.role,
+        id: result.session.user.id,
+        name: result.session.user.name,
+        email: result.session.user.email,
+        role: result.session.user.role,
       }}
     />
   );

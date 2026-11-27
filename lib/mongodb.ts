@@ -7,7 +7,7 @@ export interface UserDocument {
   emailVerifiedAt: Date | null;
   role: string;
   authProviders?: string[];
-  googleSub?: string | null;
+  googleSub?: string;
   avatarUrl?: string | null;
   createdAt: Date;
   updatedAt: Date;
@@ -83,11 +83,42 @@ export async function getMongoClient(): Promise<MongoClient> {
   return globalThis._vistraMongoClientPromise;
 }
 
+export async function ensureGoogleSubPartialIndex(usersCol: Collection<UserDocument>): Promise<void> {
+  const existingIndexes = await usersCol.indexes();
+  const current = existingIndexes.find((idx) => idx.name === 'idx_users_google_sub_unique');
+  const hasPartialStringFilter =
+    current &&
+    typeof current.partialFilterExpression === 'object' &&
+    current.partialFilterExpression !== null &&
+    (current.partialFilterExpression as { googleSub?: { $type?: string } }).googleSub?.$type === 'string';
+
+  if (current && !hasPartialStringFilter) {
+    await usersCol.dropIndex('idx_users_google_sub_unique');
+  }
+
+  await usersCol.updateMany(
+    { googleSub: null as unknown as string },
+    { $unset: { googleSub: '' } },
+  );
+
+  if (!hasPartialStringFilter) {
+    await usersCol.createIndex(
+      { googleSub: 1 },
+      {
+        unique: true,
+        partialFilterExpression: { googleSub: { $type: 'string' } },
+        name: 'idx_users_google_sub_unique',
+      },
+    );
+  }
+}
+
 async function ensureIndexes(db: Db): Promise<void> {
+  const usersCol = db.collection<UserDocument>('users');
   await Promise.all([
-    db.collection<UserDocument>('users').createIndex({ email: 1 }, { unique: true, name: 'idx_users_email_unique' }),
-    db.collection<UserDocument>('users').createIndex({ id: 1 }, { unique: true, name: 'idx_users_id_unique' }),
-    db.collection<UserDocument>('users').createIndex({ googleSub: 1 }, { unique: true, sparse: true, name: 'idx_users_google_sub_unique' }),
+    usersCol.createIndex({ email: 1 }, { unique: true, name: 'idx_users_email_unique' }),
+    usersCol.createIndex({ id: 1 }, { unique: true, name: 'idx_users_id_unique' }),
+    ensureGoogleSubPartialIndex(usersCol),
     db.collection<MagicLinkDocument>('magicLinks').createIndex({ tokenHash: 1 }, { unique: true, name: 'idx_magic_token_hash_unique' }),
     db.collection<MagicLinkDocument>('magicLinks').createIndex({ userId: 1 }, { name: 'idx_magic_user_id' }),
     db.collection<MagicLinkDocument>('magicLinks').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 3600, name: 'idx_magic_expires_ttl' }),

@@ -206,7 +206,6 @@ export async function registerUserAccount(input: {
       emailVerifiedAt: null,
       role: DEFAULT_USER_ROLE,
       authProviders: ['email'],
-      googleSub: null,
       avatarUrl: null,
       createdAt: now,
       updatedAt: now,

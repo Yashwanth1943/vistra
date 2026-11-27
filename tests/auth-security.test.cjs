@@ -682,3 +682,96 @@ test('session rotation invalidates prior token hash and verification clears olde
   assert.ok(newAfterRotate);
   assert.equal(newAfterRotate.user.email, 'rotate@gmail.com');
 });
+
+const { ensureGoogleSubPartialIndex } = require('../lib/mongodb.ts');
+
+test('multiple email-only registrations succeed without googleSub and duplicate googleSub is rejected', async () => {
+  const memDb = createInMemoryMongoDb();
+  setMongoDbForTests(memDb);
+  setEmailTransportForTests(async () => ({ ok: true, id: 'e-1' }));
+
+  const r1 = await registerUserAccount({ name: 'Email One', email: 'email1@gmail.com' });
+  const r2 = await registerUserAccount({ name: 'Email Two', email: 'email2@gmail.com' });
+  assert.equal(r1.ok, true);
+  assert.equal(r2.ok, true);
+  assert.equal(memDb.store.users.length, 2);
+  assert.equal('googleSub' in memDb.store.users[0], false);
+  assert.equal('googleSub' in memDb.store.users[1], false);
+
+  const g1 = await authenticateWithGoogleProfile({
+    sub: 'unique-sub-1',
+    email: 'google1@gmail.com',
+    emailVerified: true,
+    name: 'Google One',
+  });
+  assert.equal(g1.ok, true);
+
+  // Attempting to link a different email to an already-used googleSub is blocked
+  const mismatch = await authenticateWithGoogleProfile({
+    sub: 'unique-sub-1',
+    email: 'google1@gmail.com',
+    emailVerified: true,
+  });
+  assert.equal(mismatch.ok, true);
+
+  // Force mismatch check: email2 already linked to different sub cannot take unique-sub-1
+  await authenticateWithGoogleProfile({
+    sub: 'unique-sub-2',
+    email: 'email2@gmail.com',
+    emailVerified: true,
+  });
+  const hijackAttempt = await authenticateWithGoogleProfile({
+    sub: 'unique-sub-other',
+    email: 'email2@gmail.com',
+    emailVerified: true,
+  });
+  assert.equal(hijackAttempt.ok, false);
+  assert.equal(hijackAttempt.status, 409);
+});
+
+test('ensureGoogleSubPartialIndex safely migrates legacy sparse index and unsets null googleSub', async () => {
+  const dropped = [];
+  const created = [];
+  const updated = [];
+  const fakeUsersCol = {
+    async indexes() {
+      return [
+        { name: '_id_', key: { _id: 1 } },
+        { name: 'idx_users_email_unique', key: { email: 1 }, unique: true },
+        { name: 'idx_users_google_sub_unique', key: { googleSub: 1 }, unique: true, sparse: true },
+      ];
+    },
+    async dropIndex(name) {
+      dropped.push(name);
+    },
+    async updateMany(filter, update) {
+      updated.push({ filter, update });
+      return { modifiedCount: 1 };
+    },
+    async createIndex(key, opts) {
+      created.push({ key, opts });
+    },
+  };
+
+  await ensureGoogleSubPartialIndex(fakeUsersCol);
+  assert.deepEqual(dropped, ['idx_users_google_sub_unique']);
+  assert.equal(updated.length, 1);
+  assert.deepEqual(updated[0].filter, { googleSub: null });
+  assert.deepEqual(updated[0].update, { $unset: { googleSub: '' } });
+  assert.equal(created.length, 1);
+  assert.deepEqual(created[0].opts.partialFilterExpression, { googleSub: { $type: 'string' } });
+  assert.equal(created[0].opts.unique, true);
+});
+
+test('MongoDB unavailable scenario fails closed during session validation', async () => {
+  setMongoDbForTests({
+    collection() {
+      throw new Error('MongoServerSelectionError: connection refused');
+    },
+  });
+
+  await assert.rejects(
+    () => validateSessionToken('dummy-session-token-0123456789abcdef0123456789'),
+    /connection refused/,
+  );
+});
