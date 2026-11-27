@@ -10,6 +10,7 @@ import {
   normalizeEmail,
   normalizeName,
 } from './crypto';
+import { ALLOWED_DOMAIN_ERROR_MESSAGE, isAllowedEmailDomain } from './domain-policy';
 
 export const MAGIC_LINK_TTL_MS = 10 * 60 * 1000; // 10 minutes
 export const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
@@ -59,9 +60,19 @@ export function getEmailModeConfig(): EmailModeConfig {
 export interface RegisterResult {
   ok: boolean;
   status: number;
-  code?: 'INVALID_INPUT' | 'ACCOUNT_EXISTS' | 'EMAIL_FAILED' | 'EXTERNAL_EMAIL_UNAVAILABLE' | 'DEV_RECIPIENT_RESTRICTED' | 'EMAIL_CONFIG_ERROR';
+  code?: 'INVALID_INPUT' | 'DOMAIN_NOT_ALLOWED' | 'ACCOUNT_EXISTS' | 'EMAIL_FAILED' | 'EXTERNAL_EMAIL_UNAVAILABLE' | 'DEV_RECIPIENT_RESTRICTED' | 'EMAIL_CONFIG_ERROR';
   message: string;
   user?: Pick<AuthUser, 'id' | 'name' | 'email' | 'role'>;
+}
+
+export interface GoogleAuthResult {
+  ok: boolean;
+  status: number;
+  code?: 'UNVERIFIED_GOOGLE_EMAIL' | 'DOMAIN_NOT_ALLOWED' | 'GOOGLE_ACCOUNT_MISMATCH' | 'INVALID_INPUT';
+  message?: string;
+  user?: AuthUser;
+  sessionToken?: string;
+  sessionExpiresAt?: Date;
 }
 
 export interface RequestLoginLinkResult {
@@ -85,6 +96,7 @@ export interface ValidatedSession {
   expiresAt: string;
   renewed: boolean;
   newExpiresAt?: Date;
+  rotatedSessionToken?: string;
 }
 
 function mapUser(doc: UserDocument): AuthUser {
@@ -144,6 +156,15 @@ export async function registerUserAccount(input: {
     };
   }
 
+  if (!isAllowedEmailDomain(cleanEmail)) {
+    return {
+      ok: false,
+      status: 403,
+      code: 'DOMAIN_NOT_ALLOWED',
+      message: ALLOWED_DOMAIN_ERROR_MESSAGE,
+    };
+  }
+
   const emailConfig = getEmailModeConfig();
   if (!emailConfig.ok) {
     return {
@@ -184,6 +205,9 @@ export async function registerUserAccount(input: {
       email: cleanEmail,
       emailVerifiedAt: null,
       role: DEFAULT_USER_ROLE,
+      authProviders: ['email'],
+      googleSub: null,
+      avatarUrl: null,
       createdAt: now,
       updatedAt: now,
     });
@@ -388,6 +412,9 @@ export async function verifyMagicLinkAndCreateSession(
     return { ok: false, reason: 'expired' };
   }
 
+  // Invalidate any earlier unconsumed magic links for this user and mark email verified.
+  await magicLinks.deleteMany({ userId: consumed.userId, consumedAt: null });
+
   await users.updateOne(
     { id: consumed.userId },
     [
@@ -456,12 +483,15 @@ export async function validateSessionToken(
   const expiresMs = sessionDoc.expiresAt.getTime();
   let renewed = false;
   let newExpiresAt: Date | undefined;
+  let rotatedSessionToken: string | undefined;
 
   if (expiresMs - nowMs < SESSION_RENEWAL_THRESHOLD_MS) {
     newExpiresAt = new Date(nowMs + SESSION_TTL_MS);
+    rotatedSessionToken = generateSecureToken();
+    const rotatedHash = hashToken(rotatedSessionToken);
     await sessions.updateOne(
       { id: sessionDoc.id },
-      { $set: { expiresAt: newExpiresAt } },
+      { $set: { expiresAt: newExpiresAt, sessionTokenHash: rotatedHash } },
     );
     renewed = true;
   }
@@ -472,6 +502,7 @@ export async function validateSessionToken(
     expiresAt: (newExpiresAt ?? sessionDoc.expiresAt).toISOString(),
     renewed,
     newExpiresAt,
+    rotatedSessionToken,
   };
 }
 
@@ -482,4 +513,141 @@ export async function invalidateSessionToken(rawSessionToken: string | undefined
   const { sessions } = await getCollections();
   const sessionHash = hashToken(rawSessionToken.trim());
   await sessions.deleteOne({ sessionTokenHash: sessionHash });
+}
+
+/**
+ * Authenticates or registers a user from verified Google OIDC claims, enforcing verified
+ * email ownership, Gmail-only domain policy, and safe account linking.
+ */
+export async function authenticateWithGoogleProfile(
+  input: {
+    sub: string;
+    email: string;
+    emailVerified: boolean;
+    name?: string;
+    picture?: string;
+  },
+  nowMs = Date.now(),
+): Promise<GoogleAuthResult> {
+  if (!input.emailVerified) {
+    return {
+      ok: false,
+      status: 403,
+      code: 'UNVERIFIED_GOOGLE_EMAIL',
+      message: 'Your Google email address must be verified before signing in to Vistra.',
+    };
+  }
+
+  const cleanEmail = normalizeEmail(input.email ?? '');
+  const cleanSub = (input.sub ?? '').trim();
+  if (!cleanSub || !isValidEmail(cleanEmail)) {
+    return {
+      ok: false,
+      status: 400,
+      code: 'INVALID_INPUT',
+      message: 'Google account did not return a valid verified identity.',
+    };
+  }
+
+  if (!isAllowedEmailDomain(cleanEmail)) {
+    return {
+      ok: false,
+      status: 403,
+      code: 'DOMAIN_NOT_ALLOWED',
+      message: ALLOWED_DOMAIN_ERROR_MESSAGE,
+    };
+  }
+
+  const { users, sessions } = await getCollections();
+  const now = new Date(nowMs);
+
+  let userDoc: UserDocument | null = await users.findOne({ googleSub: cleanSub });
+  if (!userDoc) {
+    userDoc = await users.findOne({ email: cleanEmail });
+  }
+
+  if (userDoc) {
+    if (userDoc.googleSub && userDoc.googleSub !== cleanSub) {
+      return {
+        ok: false,
+        status: 409,
+        code: 'GOOGLE_ACCOUNT_MISMATCH',
+        message: 'This email address is already linked to a different Google account.',
+      };
+    }
+
+    const existingProviders = Array.isArray(userDoc.authProviders) && userDoc.authProviders.length > 0
+      ? userDoc.authProviders
+      : ['email'];
+    const mergedProviders = existingProviders.includes('google')
+      ? existingProviders
+      : [...existingProviders, 'google'];
+
+    await users.updateOne(
+      { id: userDoc.id },
+      {
+        $set: {
+          googleSub: cleanSub,
+          authProviders: mergedProviders,
+          emailVerifiedAt: userDoc.emailVerifiedAt ?? now,
+          avatarUrl: input.picture ?? userDoc.avatarUrl ?? null,
+          updatedAt: now,
+        },
+      },
+    );
+
+    userDoc = (await users.findOne({ id: userDoc.id })) ?? userDoc;
+  } else {
+    const cleanName = isValidName(input.name ?? '')
+      ? normalizeName(input.name ?? '')
+      : cleanEmail.split('@')[0];
+    const id = generateId();
+    const newDoc: UserDocument = {
+      id,
+      name: cleanName,
+      email: cleanEmail,
+      emailVerifiedAt: now,
+      role: DEFAULT_USER_ROLE,
+      authProviders: ['google'],
+      googleSub: cleanSub,
+      avatarUrl: input.picture ?? null,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    try {
+      await users.insertOne(newDoc);
+      userDoc = newDoc;
+    } catch (error) {
+      if (isDuplicateKeyError(error)) {
+        const raced = await users.findOne({ email: cleanEmail });
+        if (!raced) throw error;
+        userDoc = raced;
+      } else {
+        throw error;
+      }
+    }
+  }
+
+  // Always issue a fresh session token & ID to prevent session fixation.
+  const rawSessionToken = generateSecureToken();
+  const sessionTokenHash = hashToken(rawSessionToken);
+  const sessionId = generateId();
+  const sessionExpiresAt = new Date(nowMs + SESSION_TTL_MS);
+
+  await sessions.insertOne({
+    id: sessionId,
+    userId: userDoc.id,
+    sessionTokenHash,
+    expiresAt: sessionExpiresAt,
+    createdAt: now,
+  });
+
+  return {
+    ok: true,
+    status: 200,
+    user: mapUser(userDoc),
+    sessionToken: rawSessionToken,
+    sessionExpiresAt,
+  };
 }

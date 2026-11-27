@@ -6,6 +6,9 @@ export interface UserDocument {
   email: string;
   emailVerifiedAt: Date | null;
   role: string;
+  authProviders?: string[];
+  googleSub?: string | null;
+  avatarUrl?: string | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -84,6 +87,7 @@ async function ensureIndexes(db: Db): Promise<void> {
   await Promise.all([
     db.collection<UserDocument>('users').createIndex({ email: 1 }, { unique: true, name: 'idx_users_email_unique' }),
     db.collection<UserDocument>('users').createIndex({ id: 1 }, { unique: true, name: 'idx_users_id_unique' }),
+    db.collection<UserDocument>('users').createIndex({ googleSub: 1 }, { unique: true, sparse: true, name: 'idx_users_google_sub_unique' }),
     db.collection<MagicLinkDocument>('magicLinks').createIndex({ tokenHash: 1 }, { unique: true, name: 'idx_magic_token_hash_unique' }),
     db.collection<MagicLinkDocument>('magicLinks').createIndex({ userId: 1 }, { name: 'idx_magic_user_id' }),
     db.collection<MagicLinkDocument>('magicLinks').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 3600, name: 'idx_magic_expires_ttl' }),

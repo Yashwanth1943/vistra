@@ -29,12 +29,22 @@ Module._resolveFilename = function (request, parent, ...rest) {
 process.env.SESSION_SECRET = 'test-session-secret-0123456789abcdef0123456789abcdef';
 process.env.APP_URL = 'https://vistra-learn.vercel.app';
 
+const { generateKeyPairSync, sign: cryptoSign } = require('node:crypto');
 const { setMongoDbForTests } = require('../lib/mongodb.ts');
 const { setEmailTransportForTests } = require('../lib/email/resend.ts');
 const { checkRateLimit } = require('../lib/auth/rate-limit.ts');
+const { isAllowedEmailDomain } = require('../lib/auth/domain-policy.ts');
+const {
+  buildGoogleAuthorizationUrl,
+  constantTimeEqual,
+  createOAuthTransaction,
+  setGoogleOAuthTestHooks,
+  verifyGoogleIdToken,
+} = require('../lib/auth/google.ts');
 const {
   MAGIC_LINK_TTL_MS,
   SESSION_TTL_MS,
+  authenticateWithGoogleProfile,
   invalidateSessionToken,
   registerUserAccount,
   requestMagicLoginLink,
@@ -172,10 +182,10 @@ test('registration creates user, sends exact welcome email without secrets, and 
     return { ok: true, id: 'email-1' };
   });
 
-  const res = await registerUserAccount({ name: '  Ada   Lovelace ', email: 'ADA@Example.COM' });
+  const res = await registerUserAccount({ name: '  Ada   Lovelace ', email: 'ADA@Gmail.COM' });
   assert.equal(res.ok, true);
   assert.equal(res.status, 201);
-  assert.equal(res.user.email, 'ada@example.com');
+  assert.equal(res.user.email, 'ada@gmail.com');
   assert.equal(res.user.name, 'Ada Lovelace');
   assert.equal(res.user.role, 'student');
 
@@ -186,7 +196,7 @@ test('registration creates user, sends exact welcome email without secrets, and 
   assert.match(sent[0].text, /— Team Vistra/);
   assert.doesNotMatch(sent[0].text, /token=|password|otp/i);
 
-  const dup = await registerUserAccount({ name: 'Ada Two', email: 'ada@example.com' });
+  const dup = await registerUserAccount({ name: 'Ada Two', email: 'ada@gmail.com' });
   assert.equal(dup.ok, false);
   assert.equal(dup.status, 409);
   assert.equal(dup.code, 'ACCOUNT_EXISTS');
@@ -198,7 +208,7 @@ test('registration fails honestly and rolls back when email delivery fails', asy
   setMongoDbForTests(memDb);
   setEmailTransportForTests(async () => ({ ok: false, error: 'Resend API down' }));
 
-  const res = await registerUserAccount({ name: 'Grace Hopper', email: 'grace@example.com' });
+  const res = await registerUserAccount({ name: 'Grace Hopper', email: 'grace@gmail.com' });
   assert.equal(res.ok, false);
   assert.equal(res.status, 502);
   assert.equal(res.code, 'EMAIL_FAILED');
@@ -215,17 +225,17 @@ test('login-link request stores only hashed token, uses neutral response for unk
     return { ok: true, id: `email-${sent.length}` };
   });
 
-  await registerUserAccount({ name: 'Alan Turing', email: 'alan@example.com' });
+  await registerUserAccount({ name: 'Alan Turing', email: 'alan@gmail.com' });
   sent.length = 0;
 
-  const unknownRes = await requestMagicLoginLink({ email: 'unknown@example.com' });
+  const unknownRes = await requestMagicLoginLink({ email: 'unknown@gmail.com' });
   assert.equal(unknownRes.ok, true);
   assert.equal(unknownRes.status, 200);
   assert.equal(unknownRes.message, 'If an account exists for this email address, a secure login link has been sent.');
   assert.equal(sent.length, 0);
 
   const nowMs = Date.UTC(2026, 10, 27, 9, 0, 0);
-  const knownRes = await requestMagicLoginLink({ email: 'ALAN@example.com', nowMs });
+  const knownRes = await requestMagicLoginLink({ email: 'ALAN@gmail.com', nowMs });
   assert.equal(knownRes.ok, true);
   assert.equal(knownRes.status, 200);
   assert.equal(knownRes.message, unknownRes.message);
@@ -242,7 +252,7 @@ test('login-link request stores only hashed token, uses neutral response for unk
 
   const verified = await verifyMagicLinkAndCreateSession(rawToken, nowMs + 60_000);
   assert.equal(verified.ok, true);
-  assert.equal(verified.user.email, 'alan@example.com');
+  assert.equal(verified.user.email, 'alan@gmail.com');
   assert.ok(verified.user.emailVerifiedAt);
   assert.ok(verified.sessionToken);
 
@@ -252,7 +262,7 @@ test('login-link request stores only hashed token, uses neutral response for unk
 
   const validSession = await validateSessionToken(verified.sessionToken, nowMs + 62_000);
   assert.ok(validSession);
-  assert.equal(validSession.user.email, 'alan@example.com');
+  assert.equal(validSession.user.email, 'alan@gmail.com');
 
   await invalidateSessionToken(verified.sessionToken);
   const afterLogout = await validateSessionToken(verified.sessionToken, nowMs + 63_000);
@@ -269,11 +279,11 @@ test('expired, invalid, and concurrent magic-link verifications are rejected saf
     return { ok: true, id: `email-${sent.length}` };
   });
 
-  await registerUserAccount({ name: 'Linus', email: 'linus@example.com' });
+  await registerUserAccount({ name: 'Linus', email: 'linus@gmail.com' });
   sent.length = 0;
 
   const t0 = Date.UTC(2026, 10, 27, 10, 0, 0);
-  await requestMagicLoginLink({ email: 'linus@example.com', nowMs: t0 });
+  await requestMagicLoginLink({ email: 'linus@gmail.com', nowMs: t0 });
   const expiredToken = decodeURIComponent(sent[0].text.match(/token=([^\s]+)/)[1]);
 
   const expiredResult = await verifyMagicLinkAndCreateSession(expiredToken, t0 + MAGIC_LINK_TTL_MS + 1000);
@@ -285,7 +295,7 @@ test('expired, invalid, and concurrent magic-link verifications are rejected saf
   assert.equal(invalidResult.reason, 'invalid');
 
   sent.length = 0;
-  await requestMagicLoginLink({ email: 'linus@example.com', nowMs: t0 + 5000 });
+  await requestMagicLoginLink({ email: 'linus@gmail.com', nowMs: t0 + 5000 });
   const raceToken = decodeURIComponent(sent[0].text.match(/token=([^\s]+)/)[1]);
   const results = await Promise.all([
     verifyMagicLinkAndCreateSession(raceToken, t0 + 6000),
@@ -336,10 +346,10 @@ test('EMAIL_MODE=development restricts emails to RESEND_TEST_RECIPIENT and fails
   try {
     process.env.NODE_ENV = 'development';
     process.env.EMAIL_MODE = 'development';
-    process.env.RESEND_TEST_RECIPIENT = 'owner-test@example.com';
+    process.env.RESEND_TEST_RECIPIENT = 'owner-test@gmail.com';
 
     // Unsupported recipient on registration is rejected
-    const blockedReg = await registerUserAccount({ name: 'Other Student', email: 'student@example.com' });
+    const blockedReg = await registerUserAccount({ name: 'Other Student', email: 'student@gmail.com' });
     assert.equal(blockedReg.ok, false);
     assert.equal(blockedReg.status, 403);
     assert.equal(blockedReg.code, 'DEV_RECIPIENT_RESTRICTED');
@@ -350,19 +360,19 @@ test('EMAIL_MODE=development restricts emails to RESEND_TEST_RECIPIENT and fails
     assert.equal(memDb.store.users.length, 0);
 
     // Unsupported recipient on login is rejected
-    const blockedLogin = await requestMagicLoginLink({ email: 'student@example.com' });
+    const blockedLogin = await requestMagicLoginLink({ email: 'student@gmail.com' });
     assert.equal(blockedLogin.ok, false);
     assert.equal(blockedLogin.status, 403);
     assert.equal(blockedLogin.code, 'DEV_RECIPIENT_RESTRICTED');
     assert.equal(sent.length, 0);
 
     // Configured test recipient works end-to-end (still requires real magic-link verification)
-    const okReg = await registerUserAccount({ name: 'Vistra Owner', email: 'OWNER-TEST@example.com' });
+    const okReg = await registerUserAccount({ name: 'Vistra Owner', email: 'OWNER-TEST@gmail.com' });
     assert.equal(okReg.ok, true);
     assert.equal(okReg.status, 201);
     assert.equal(sent.length, 1);
 
-    const okLogin = await requestMagicLoginLink({ email: 'owner-test@example.com' });
+    const okLogin = await requestMagicLoginLink({ email: 'owner-test@gmail.com' });
     assert.equal(okLogin.ok, true);
     assert.equal(sent.length, 2);
 
@@ -373,11 +383,11 @@ test('EMAIL_MODE=development restricts emails to RESEND_TEST_RECIPIENT and fails
     const rawToken = decodeURIComponent(sent[1].text.match(/token=([^\s]+)/)[1]);
     const verified = await verifyMagicLinkAndCreateSession(rawToken);
     assert.equal(verified.ok, true);
-    assert.equal(verified.user.email, 'owner-test@example.com');
+    assert.equal(verified.user.email, 'owner-test@gmail.com');
 
     // Production rejects EMAIL_MODE=development
     process.env.NODE_ENV = 'production';
-    const prodBlocked = await requestMagicLoginLink({ email: 'owner-test@example.com' });
+    const prodBlocked = await requestMagicLoginLink({ email: 'owner-test@gmail.com' });
     assert.equal(prodBlocked.ok, false);
     assert.equal(prodBlocked.status, 503);
     assert.equal(prodBlocked.code, 'EMAIL_CONFIG_ERROR');
@@ -399,10 +409,276 @@ test('Resend test-sender restriction rolls back user and returns clear external-
     error: 'Resend test-sender restriction: external recipients require a verified domain.',
   }));
 
-  const res = await registerUserAccount({ name: 'External User', email: 'external@example.com' });
+  const res = await registerUserAccount({ name: 'External User', email: 'external@gmail.com' });
   assert.equal(res.ok, false);
   assert.equal(res.status, 403);
   assert.equal(res.code, 'EXTERNAL_EMAIL_UNAVAILABLE');
   assert.match(res.message, /External email delivery is not currently available/i);
   assert.equal(memDb.store.users.length, 0);
+});
+
+function signTestJwt(payload, privateKey, headerOverrides = {}) {
+  const header = Buffer.from(
+    JSON.stringify({ alg: 'RS256', kid: 'test-kid-1', typ: 'JWT', ...headerOverrides }),
+  ).toString('base64url');
+  const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const sig = cryptoSign('RSA-SHA256', Buffer.from(`${header}.${body}`), privateKey).toString('base64url');
+  return `${header}.${body}.${sig}`;
+}
+
+test('Gmail-only domain policy rejects non-Gmail, lookalike, and subdomain addresses', async () => {
+  const memDb = createInMemoryMongoDb();
+  setMongoDbForTests(memDb);
+  setEmailTransportForTests(async () => ({ ok: true, id: 'email-1' }));
+
+  assert.equal(isAllowedEmailDomain('student@gmail.com'), true);
+  assert.equal(isAllowedEmailDomain('Student@GMAIL.COM'), true);
+  assert.equal(isAllowedEmailDomain('student@yahoo.com'), false);
+  assert.equal(isAllowedEmailDomain('student@gmai1.com'), false);
+  assert.equal(isAllowedEmailDomain('student@sub.gmail.com'), false);
+  assert.equal(isAllowedEmailDomain('student@gmail.com.evil.com'), false);
+
+  for (const badEmail of ['student@yahoo.com', 'student@gmai1.com', 'student@sub.gmail.com']) {
+    const res = await registerUserAccount({ name: 'Non Gmail', email: badEmail });
+    assert.equal(res.ok, false);
+    assert.equal(res.status, 403);
+    assert.equal(res.code, 'DOMAIN_NOT_ALLOWED');
+    assert.equal(res.message, 'Vistra registration is currently available only to verified Gmail accounts.');
+  }
+  assert.equal(memDb.store.users.length, 0);
+});
+
+test('Google OIDC ID token verification validates signature, issuer, audience, expiry, nonce, and verified email', async () => {
+  const { publicKey, privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const publicJwk = publicKey.export({ format: 'jwk' });
+  setGoogleOAuthTestHooks({
+    jwksFetcher: async () => ({ keys: [{ ...publicJwk, kid: 'test-kid-1', alg: 'RS256', use: 'sig' }] }),
+  });
+
+  const nowSec = 1_800_000_000;
+  const baseClaims = {
+    iss: 'https://accounts.google.com',
+    aud: 'google-client-id-123',
+    sub: 'google-sub-001',
+    email: 'learner@gmail.com',
+    email_verified: true,
+    name: 'Google Learner',
+    nonce: 'nonce-abc',
+    iat: nowSec - 60,
+    exp: nowSec + 3600,
+  };
+
+  try {
+    // Valid ID token
+    const validJwt = signTestJwt(baseClaims, privateKey);
+    const verified = await verifyGoogleIdToken({
+      idToken: validJwt,
+      expectedAudience: 'google-client-id-123',
+      expectedNonce: 'nonce-abc',
+      nowSeconds: nowSec,
+    });
+    assert.equal(verified.email, 'learner@gmail.com');
+    assert.equal(verified.sub, 'google-sub-001');
+
+    // Tampered signature rejected
+    const parts = validJwt.split('.');
+    const tamperedJwt = `${parts[0]}.${parts[1]}.AAAA${parts[2].slice(4)}`;
+    await assert.rejects(
+      () => verifyGoogleIdToken({ idToken: tamperedJwt, expectedAudience: 'google-client-id-123', nowSeconds: nowSec }),
+      /Invalid Google ID token signature/,
+    );
+
+    // Wrong audience rejected
+    const wrongAud = signTestJwt({ ...baseClaims, aud: 'other-app-id' }, privateKey);
+    await assert.rejects(
+      () => verifyGoogleIdToken({ idToken: wrongAud, expectedAudience: 'google-client-id-123', nowSeconds: nowSec }),
+      /audience/i,
+    );
+
+    // Wrong issuer rejected
+    const wrongIss = signTestJwt({ ...baseClaims, iss: 'https://evil.example.com' }, privateKey);
+    await assert.rejects(
+      () => verifyGoogleIdToken({ idToken: wrongIss, expectedAudience: 'google-client-id-123', nowSeconds: nowSec }),
+      /issuer/i,
+    );
+
+    // Expired token rejected
+    const expiredJwt = signTestJwt({ ...baseClaims, exp: nowSec - 10 }, privateKey);
+    await assert.rejects(
+      () => verifyGoogleIdToken({ idToken: expiredJwt, expectedAudience: 'google-client-id-123', nowSeconds: nowSec }),
+      /expired/i,
+    );
+
+    // Unverified email rejected
+    const unverifiedJwt = signTestJwt({ ...baseClaims, email_verified: false }, privateKey);
+    await assert.rejects(
+      () => verifyGoogleIdToken({ idToken: unverifiedJwt, expectedAudience: 'google-client-id-123', nowSeconds: nowSec }),
+      /not verified/i,
+    );
+
+    // Nonce mismatch rejected
+    await assert.rejects(
+      () => verifyGoogleIdToken({ idToken: validJwt, expectedAudience: 'google-client-id-123', expectedNonce: 'wrong-nonce', nowSeconds: nowSec }),
+      /nonce/i,
+    );
+  } finally {
+    setGoogleOAuthTestHooks({ jwksFetcher: null });
+  }
+});
+
+test('Google Sign-In creates Gmail users, links existing users safely without duplicates, and rejects non-Gmail or unverified users', async () => {
+  const memDb = createInMemoryMongoDb();
+  setMongoDbForTests(memDb);
+  setEmailTransportForTests(async () => ({ ok: true, id: 'email-1' }));
+
+  // Non-Gmail Google account rejected
+  const nonGmail = await authenticateWithGoogleProfile({
+    sub: 'g-sub-1',
+    email: 'corp@company.com',
+    emailVerified: true,
+    name: 'Corp User',
+  });
+  assert.equal(nonGmail.ok, false);
+  assert.equal(nonGmail.status, 403);
+  assert.equal(nonGmail.code, 'DOMAIN_NOT_ALLOWED');
+  assert.equal(nonGmail.message, 'Vistra registration is currently available only to verified Gmail accounts.');
+
+  // Unverified Google email rejected
+  const unverified = await authenticateWithGoogleProfile({
+    sub: 'g-sub-2',
+    email: 'unverified@gmail.com',
+    emailVerified: false,
+    name: 'Unverified',
+  });
+  assert.equal(unverified.ok, false);
+  assert.equal(unverified.status, 403);
+  assert.equal(unverified.code, 'UNVERIFIED_GOOGLE_EMAIL');
+
+  // Register existing email user first, then link via Google Sign-In
+  const emailReg = await registerUserAccount({ name: 'Existing Student', email: 'existing@gmail.com' });
+  assert.equal(emailReg.ok, true);
+  const originalId = emailReg.user.id;
+
+  const linked = await authenticateWithGoogleProfile({
+    sub: 'g-sub-linked',
+    email: 'EXISTING@gmail.com',
+    emailVerified: true,
+    name: 'Existing Student',
+  });
+  assert.equal(linked.ok, true);
+  assert.equal(linked.user.id, originalId);
+  assert.equal(linked.user.role, 'student');
+  assert.ok(linked.sessionToken);
+  assert.equal(memDb.store.users.length, 1);
+  assert.deepEqual(memDb.store.users[0].authProviders, ['email', 'google']);
+  assert.equal(memDb.store.users[0].googleSub, 'g-sub-linked');
+
+  // Session persists and can be validated
+  const validSession = await validateSessionToken(linked.sessionToken);
+  assert.ok(validSession);
+  assert.equal(validSession.user.id, originalId);
+
+  // Mismatched googleSub for the same email is rejected
+  const mismatch = await authenticateWithGoogleProfile({
+    sub: 'g-sub-different',
+    email: 'existing@gmail.com',
+    emailVerified: true,
+  });
+  assert.equal(mismatch.ok, false);
+  assert.equal(mismatch.status, 409);
+  assert.equal(mismatch.code, 'GOOGLE_ACCOUNT_MISMATCH');
+
+  // New Gmail user via Google Sign-In
+  const newGoogle = await authenticateWithGoogleProfile({
+    sub: 'g-sub-new',
+    email: 'brandnew@gmail.com',
+    emailVerified: true,
+    name: 'Brand New',
+  });
+  assert.equal(newGoogle.ok, true);
+  assert.equal(memDb.store.users.length, 2);
+  assert.deepEqual(memDb.store.users[1].authProviders, ['google']);
+});
+
+test('OAuth state and PKCE authorization URL generation are CSRF-safe', () => {
+  const tx = createOAuthTransaction();
+  assert.ok(tx.state.length >= 32);
+  assert.ok(tx.codeVerifier.length >= 32);
+  assert.ok(tx.nonce.length >= 32);
+  assert.equal(constantTimeEqual(tx.state, tx.state), true);
+  assert.equal(constantTimeEqual(tx.state, 'tampered-state'), false);
+
+  const authUrl = buildGoogleAuthorizationUrl(
+    {
+      clientId: 'cid-1',
+      clientSecret: 'csec-1',
+      redirectUri: 'https://vistra-learn.vercel.app/api/auth/google/callback',
+    },
+    tx,
+  );
+  const parsed = new URL(authUrl);
+  assert.equal(parsed.origin, 'https://accounts.google.com');
+  assert.equal(parsed.searchParams.get('scope'), 'openid email profile');
+  assert.equal(parsed.searchParams.get('code_challenge_method'), 'S256');
+  assert.equal(parsed.searchParams.get('state'), tx.state);
+  assert.equal(parsed.searchParams.get('nonce'), tx.nonce);
+});
+
+const { verifySameOriginRequest } = require('../lib/auth/csrf.ts');
+
+test('CSRF same-origin check blocks cross-site POST requests and allows same-origin', () => {
+  const crossOriginReq = new Request('https://vistra-learn.vercel.app/api/auth/logout', {
+    method: 'POST',
+    headers: { origin: 'https://evil.example.com', 'sec-fetch-site': 'cross-site' },
+  });
+  assert.equal(verifySameOriginRequest(crossOriginReq), false);
+
+  const sameOriginReq = new Request('https://vistra-learn.vercel.app/api/auth/logout', {
+    method: 'POST',
+    headers: { origin: 'https://vistra-learn.vercel.app', 'sec-fetch-site': 'same-origin' },
+  });
+  assert.equal(verifySameOriginRequest(sameOriginReq), true);
+});
+
+test('session rotation invalidates prior token hash and verification clears older pending magic links', async () => {
+  const memDb = createInMemoryMongoDb();
+  setMongoDbForTests(memDb);
+  const sent = [];
+  setEmailTransportForTests(async (p) => {
+    sent.push(p);
+    return { ok: true, id: `e-${sent.length}` };
+  });
+
+  await registerUserAccount({ name: 'Rotate User', email: 'rotate@gmail.com' });
+  sent.length = 0;
+
+  const t0 = Date.UTC(2026, 10, 27, 12, 0, 0);
+  await requestMagicLoginLink({ email: 'rotate@gmail.com', nowMs: t0 });
+  await requestMagicLoginLink({ email: 'rotate@gmail.com', nowMs: t0 + 1000 });
+  const olderToken = decodeURIComponent(sent[0].text.match(/token=([^\s]+)/)[1]);
+  const newerToken = decodeURIComponent(sent[1].text.match(/token=([^\s]+)/)[1]);
+
+  const verified = await verifyMagicLinkAndCreateSession(newerToken, t0 + 2000);
+  assert.equal(verified.ok, true);
+
+  // Older unconsumed magic link was invalidated
+  const olderResult = await verifyMagicLinkAndCreateSession(olderToken, t0 + 3000);
+  assert.equal(olderResult.ok, false);
+
+  // Past half-life, validateSessionToken rotates the session token
+  const afterHalfLife = t0 + 2000 + SESSION_TTL_MS / 2 + 60_000;
+  const rotated = await validateSessionToken(verified.sessionToken, afterHalfLife);
+  assert.ok(rotated);
+  assert.equal(rotated.renewed, true);
+  assert.ok(rotated.rotatedSessionToken);
+  assert.notEqual(rotated.rotatedSessionToken, verified.sessionToken);
+
+  // Old session token is no longer valid after rotation
+  const oldAfterRotate = await validateSessionToken(verified.sessionToken, afterHalfLife + 1000);
+  assert.equal(oldAfterRotate, null);
+
+  // New rotated session token is valid
+  const newAfterRotate = await validateSessionToken(rotated.rotatedSessionToken, afterHalfLife + 1000);
+  assert.ok(newAfterRotate);
+  assert.equal(newAfterRotate.user.email, 'rotate@gmail.com');
 });

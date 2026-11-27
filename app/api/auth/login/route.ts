@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { normalizeEmail } from '@/lib/auth/crypto';
+import { verifySameOriginRequest } from '@/lib/auth/csrf';
 import { handleAuthRouteError } from '@/lib/auth/http-error';
 import { checkRateLimit } from '@/lib/auth/rate-limit';
 import { requestMagicLoginLink } from '@/lib/auth/service';
@@ -10,6 +11,9 @@ const LOGIN_MAX_PER_IP = 15;
 const LOGIN_MAX_PER_EMAIL = 5;
 
 export async function POST(request: Request) {
+  if (!verifySameOriginRequest(request)) {
+    return NextResponse.json({ ok: false, message: 'Forbidden' }, { status: 403 });
+  }
   try {
     const ip = await getClientIp(request);
     const ipLimit = await checkRateLimit('login:ip', ip, LOGIN_MAX_PER_IP, LOGIN_WINDOW_MS);

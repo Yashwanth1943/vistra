@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server';
+import { verifySameOriginRequest } from '@/lib/auth/csrf';
 import { handleAuthRouteError } from '@/lib/auth/http-error';
 import { checkRateLimit } from '@/lib/auth/rate-limit';
 import { registerUserAccount } from '@/lib/auth/service';
@@ -8,6 +9,9 @@ const REGISTER_WINDOW_MS = 10 * 60 * 1000;
 const REGISTER_MAX_PER_IP = 5;
 
 export async function POST(request: Request) {
+  if (!verifySameOriginRequest(request)) {
+    return NextResponse.json({ ok: false, message: 'Forbidden' }, { status: 403 });
+  }
   try {
     const ip = await getClientIp(request);
     const ipLimit = await checkRateLimit('register:ip', ip, REGISTER_MAX_PER_IP, REGISTER_WINDOW_MS);

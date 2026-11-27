@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server';
+import { verifySameOriginRequest } from '@/lib/auth/csrf';
 import { handleAuthRouteError } from '@/lib/auth/http-error';
 import { checkRateLimit } from '@/lib/auth/rate-limit';
 import { verifyMagicLinkAndCreateSession } from '@/lib/auth/service';
@@ -8,6 +9,9 @@ const VERIFY_WINDOW_MS = 10 * 60 * 1000;
 const VERIFY_MAX_PER_IP = 15;
 
 export async function POST(request: Request) {
+  if (!verifySameOriginRequest(request)) {
+    return NextResponse.json({ ok: false, reason: 'forbidden', message: 'Forbidden' }, { status: 403 });
+  }
   try {
     const ip = await getClientIp(request);
     const ipLimit = await checkRateLimit('verify:ip', ip, VERIFY_MAX_PER_IP, VERIFY_WINDOW_MS);
