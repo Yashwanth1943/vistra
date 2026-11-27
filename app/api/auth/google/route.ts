@@ -6,7 +6,7 @@ import {
   OAUTH_TX_COOKIE_NAME,
   OAUTH_TX_TTL_SECONDS,
 } from '@/lib/auth/google';
-import { handleAuthRouteError } from '@/lib/auth/http-error';
+import { handleAuthRouteError, sanitizeAuthError } from '@/lib/auth/http-error';
 import { checkRateLimit } from '@/lib/auth/rate-limit';
 import { getAppUrl } from '@/lib/auth/service';
 import { getClientIp } from '@/lib/auth/session';
@@ -46,9 +46,7 @@ export async function GET(request: Request) {
     });
     return response;
   } catch (error) {
-    console.error('[auth:google-start]', {
-      name: error instanceof Error ? error.name : 'UnknownError',
-    });
+    console.error('[auth:google-start]', sanitizeAuthError(error));
     return handleAuthRouteError('google-start', error);
   }
 }

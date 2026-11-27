@@ -57,6 +57,7 @@ function matchesFilter(doc, filter) {
     const dv = doc[k];
     if (v && typeof v === 'object' && !(v instanceof Date)) {
       if ('$gt' in v && !(dv instanceof Date ? dv.getTime() > v.$gt.getTime() : dv > v.$gt)) return false;
+      if ('$lt' in v && !(dv instanceof Date ? dv.getTime() < v.$lt.getTime() : dv < v.$lt)) return false;
       if ('$lte' in v && !(dv instanceof Date ? dv.getTime() <= v.$lte.getTime() : dv <= v.$lte)) return false;
     } else if (v === null) {
       if (dv !== null && dv !== undefined) return false;
@@ -97,12 +98,13 @@ function applyUpdate(doc, update) {
 }
 
 function createInMemoryMongoDb() {
-  const store = { users: [], magicLinks: [], sessions: [], rateLimits: [] };
+  const store = { users: [], magicLinks: [], sessions: [], rateLimits: [], emailOtps: [] };
   const uniqueFields = {
     users: ['email', 'id'],
     magicLinks: ['tokenHash'],
     sessions: ['sessionTokenHash'],
     rateLimits: ['key'],
+    emailOtps: ['id'],
   };
 
   function makeCollection(name) {
@@ -774,4 +776,529 @@ test('MongoDB unavailable scenario fails closed during session validation', asyn
     () => validateSessionToken('dummy-session-token-0123456789abcdef0123456789'),
     /connection refused/,
   );
+});
+
+const {
+  OTP_MAX_ATTEMPTS,
+  OTP_RESEND_COOLDOWN_MS,
+  OTP_TTL_MS,
+  generateNumericOtp,
+  hashOtp,
+  verifyOtpHashConstantTime,
+} = require('../lib/auth/otp.ts');
+const {
+  requestLoginOtp,
+  requestRegistrationOtp,
+  verifyLoginOtp,
+  verifyRegistrationOtp,
+} = require('../lib/auth/service.ts');
+const regReqRoute = require('../app/api/auth/otp/register/request/route.ts');
+const regVerifyRoute = require('../app/api/auth/otp/register/verify/route.ts');
+const loginReqRoute = require('../app/api/auth/otp/login/request/route.ts');
+const loginVerifyRoute = require('../app/api/auth/otp/login/verify/route.ts');
+
+test('OTP crypto generates 6-digit codes, hashes with domain separation, and verifies in constant time', () => {
+  for (let i = 0; i < 20; i++) {
+    const code = generateNumericOtp();
+    assert.match(code, /^\d{6}$/);
+  }
+  const h1 = hashOtp({ purpose: 'register', email: 'User@Gmail.com', challengeId: 'c1', otp: '123456' });
+  const h2 = hashOtp({ purpose: 'register', email: 'user@gmail.com', challengeId: 'c1', otp: '123456' });
+  const h3 = hashOtp({ purpose: 'login', email: 'user@gmail.com', challengeId: 'c1', otp: '123456' });
+  assert.equal(h1, h2);
+  assert.notEqual(h1, h3);
+  assert.equal(verifyOtpHashConstantTime(h1, h2), true);
+  assert.equal(verifyOtpHashConstantTime(h1, h3), false);
+});
+
+test('registration OTP creates user only after verification, enforces cooldown, expiry, 5-attempt lockout, and single-use concurrency', async () => {
+  const memDb = createInMemoryMongoDb();
+  setMongoDbForTests(memDb);
+
+  const sent = [];
+  setEmailTransportForTests(async (payload) => {
+    sent.push(payload);
+    return { ok: true, id: `otp-email-${sent.length}` };
+  });
+
+  const t0 = Date.UTC(2026, 10, 27, 15, 0, 0);
+
+  // Request registration OTP
+  const reqRes = await requestRegistrationOtp({ name: 'Otp Student', email: 'otpstudent@gmail.com', nowMs: t0 });
+  assert.equal(reqRes.ok, true);
+  assert.equal(reqRes.status, 200);
+  assert.ok(reqRes.challengeId);
+  assert.equal(sent.length, 1);
+  // User must NOT exist before OTP verification
+  assert.equal(memDb.store.users.length, 0);
+  assert.equal(memDb.store.emailOtps.length, 1);
+
+  const otpMatch = sent[0].text.match(/\b(\d{6})\b/);
+  assert.ok(otpMatch);
+  const rawOtp = otpMatch[1];
+  // Raw OTP must not be stored in DB or returned in response
+  assert.notEqual(memDb.store.emailOtps[0].otpHash, rawOtp);
+  assert.equal(JSON.stringify(reqRes).includes(rawOtp), false);
+
+  // Resend cooldown enforced for 60s
+  const tooSoon = await requestRegistrationOtp({
+    name: 'Otp Student',
+    email: 'otpstudent@gmail.com',
+    nowMs: t0 + 15_000,
+  });
+  assert.equal(tooSoon.ok, false);
+  assert.equal(tooSoon.status, 429);
+  assert.equal(tooSoon.code, 'RESEND_COOLDOWN');
+  assert.ok(tooSoon.retryAfterSeconds >= 40);
+
+  // Expired OTP rejected after 5 minutes
+  const expiredVerify = await verifyRegistrationOtp({
+    email: 'otpstudent@gmail.com',
+    otp: rawOtp,
+    challengeId: reqRes.challengeId,
+    nowMs: t0 + OTP_TTL_MS + 1000,
+  });
+  assert.equal(expiredVerify.ok, false);
+  assert.equal(expiredVerify.status, 401);
+  assert.equal(expiredVerify.code, 'OTP_EXPIRED');
+
+  // After 60s cooldown, resend succeeds and issues a fresh OTP
+  const resendRes = await requestRegistrationOtp({
+    name: 'Otp Student',
+    email: 'otpstudent@gmail.com',
+    nowMs: t0 + OTP_RESEND_COOLDOWN_MS + 1000,
+  });
+  assert.equal(resendRes.ok, true);
+  const freshOtp = sent[1].text.match(/\b(\d{6})\b/)[1];
+
+  // 5 incorrect attempts lock the challenge
+  for (let attempt = 1; attempt <= OTP_MAX_ATTEMPTS; attempt++) {
+    const wrongOtp = freshOtp === '000000' ? '111111' : '000000';
+    const bad = await verifyRegistrationOtp({
+      email: 'otpstudent@gmail.com',
+      otp: wrongOtp,
+      challengeId: resendRes.challengeId,
+      nowMs: t0 + OTP_RESEND_COOLDOWN_MS + 2000 + attempt * 100,
+    });
+    assert.equal(bad.ok, false);
+    if (attempt < OTP_MAX_ATTEMPTS) {
+      assert.equal(bad.status, 401);
+      assert.equal(bad.code, 'INVALID_OTP');
+    } else {
+      assert.equal(bad.status, 429);
+      assert.equal(bad.code, 'OTP_LOCKED');
+    }
+  }
+  assert.equal(memDb.store.users.length, 0);
+
+  // Request a 3rd OTP and test concurrent verification: only 1 succeeds
+  const thirdReq = await requestRegistrationOtp({
+    name: 'Otp Student',
+    email: 'otpstudent@gmail.com',
+    nowMs: t0 + OTP_RESEND_COOLDOWN_MS * 3,
+  });
+  assert.equal(thirdReq.ok, true);
+  const thirdOtp = sent[2].text.match(/\b(\d{6})\b/)[1];
+
+  const raceResults = await Promise.all([
+    verifyRegistrationOtp({
+      email: 'otpstudent@gmail.com',
+      otp: thirdOtp,
+      challengeId: thirdReq.challengeId,
+      nowMs: t0 + OTP_RESEND_COOLDOWN_MS * 3 + 5000,
+    }),
+    verifyRegistrationOtp({
+      email: 'otpstudent@gmail.com',
+      otp: thirdOtp,
+      challengeId: thirdReq.challengeId,
+      nowMs: t0 + OTP_RESEND_COOLDOWN_MS * 3 + 5000,
+    }),
+  ]);
+  const winners = raceResults.filter((r) => r.ok);
+  const losers = raceResults.filter((r) => !r.ok);
+  assert.equal(winners.length, 1);
+  assert.equal(losers.length, 1);
+  assert.equal(memDb.store.users.length, 1);
+  assert.deepEqual(memDb.store.users[0].authProviders, ['email-otp']);
+  assert.ok(winners[0].sessionToken);
+
+  // Duplicate registration after verification is blocked
+  const dup = await requestRegistrationOtp({
+    name: 'Otp Student',
+    email: 'otpstudent@gmail.com',
+    nowMs: t0 + OTP_RESEND_COOLDOWN_MS * 5,
+  });
+  assert.equal(dup.ok, false);
+  assert.equal(dup.status, 409);
+  assert.equal(dup.code, 'ACCOUNT_EXISTS');
+});
+
+test('login OTP authenticates existing Google and magic-link users while preserving ID, role, and metadata', async () => {
+  const memDb = createInMemoryMongoDb();
+  setMongoDbForTests(memDb);
+
+  const sent = [];
+  setEmailTransportForTests(async (payload) => {
+    sent.push(payload);
+    return { ok: true, id: `login-otp-${sent.length}` };
+  });
+
+  // Unknown email returns generic 200 without sending email
+  const unknown = await requestLoginOtp({ email: 'nobody@gmail.com' });
+  assert.equal(unknown.ok, true);
+  assert.equal(unknown.status, 200);
+  assert.equal(sent.length, 0);
+
+  // 1. Existing Google user with custom role 'mentor'
+  const gAuth = await authenticateWithGoogleProfile({
+    sub: 'google-sub-preserve',
+    email: 'google-existing@gmail.com',
+    emailVerified: true,
+    name: 'Google Mentor',
+  });
+  assert.equal(gAuth.ok, true);
+  const googleUser = memDb.store.users.find((u) => u.email === 'google-existing@gmail.com');
+  googleUser.role = 'mentor';
+
+  const gOtpReq = await requestLoginOtp({ email: 'GOOGLE-EXISTING@gmail.com' });
+  assert.equal(gOtpReq.ok, true);
+  assert.equal(sent.length, 1);
+  const gOtp = sent[0].text.match(/\b(\d{6})\b/)[1];
+
+  const gOtpVerify = await verifyLoginOtp({ email: 'google-existing@gmail.com', otp: gOtp });
+  assert.equal(gOtpVerify.ok, true);
+  assert.equal(gOtpVerify.user.id, googleUser.id);
+  assert.equal(gOtpVerify.user.role, 'mentor');
+  assert.equal(googleUser.googleSub, 'google-sub-preserve');
+  assert.deepEqual(googleUser.authProviders, ['google', 'email-otp']);
+
+  // 2. Existing magic-link user
+  sent.length = 0;
+  await registerUserAccount({ name: 'Magic User', email: 'magic-existing@gmail.com' });
+  const magicUser = memDb.store.users.find((u) => u.email === 'magic-existing@gmail.com');
+  const originalMagicId = magicUser.id;
+  sent.length = 0;
+
+  const mOtpReq = await requestLoginOtp({ email: 'magic-existing@gmail.com' });
+  assert.equal(mOtpReq.ok, true);
+  assert.equal(sent.length, 1);
+  const mOtp = sent[0].text.match(/\b(\d{6})\b/)[1];
+
+  const mOtpVerify = await verifyLoginOtp({ email: 'magic-existing@gmail.com', otp: mOtp });
+  assert.equal(mOtpVerify.ok, true);
+  assert.equal(mOtpVerify.user.id, originalMagicId);
+  assert.equal(mOtpVerify.user.role, 'student');
+  assert.deepEqual(magicUser.authProviders, ['email', 'email-otp']);
+});
+
+test('OTP email delivery failure cleans up pending challenge and OTP HTTP routes enforce CSRF, rate limits, and HttpOnly cookies', async () => {
+  const memDb = createInMemoryMongoDb();
+  setMongoDbForTests(memDb);
+
+  // Email delivery failure invalidates challenge
+  setEmailTransportForTests(async () => ({ ok: false, error: 'Resend error' }));
+  const failedReg = await requestRegistrationOtp({ name: 'Fail User', email: 'fail@gmail.com' });
+  assert.equal(failedReg.ok, false);
+  assert.equal(failedReg.status, 502);
+  assert.equal(memDb.store.emailOtps.length, 0);
+  assert.equal(memDb.store.users.length, 0);
+
+  // Route handler CSRF & HttpOnly cookie checks
+  const sent = [];
+  setEmailTransportForTests(async (p) => {
+    sent.push(p);
+    return { ok: true, id: `http-${sent.length}` };
+  });
+
+  const csrfBlocked = await regReqRoute.POST(
+    new Request('https://vistra-learn.vercel.app/api/auth/otp/register/request', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        origin: 'https://evil.example.com',
+        'sec-fetch-site': 'cross-site',
+      },
+      body: JSON.stringify({ name: 'Evil', email: 'evil@gmail.com' }),
+    }),
+  );
+  assert.equal(csrfBlocked.status, 403);
+
+  const regReqHttp = await regReqRoute.POST(
+    new Request('https://vistra-learn.vercel.app/api/auth/otp/register/request', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        origin: 'https://vistra-learn.vercel.app',
+        'sec-fetch-site': 'same-origin',
+        'x-forwarded-for': '203.0.113.10',
+      },
+      body: JSON.stringify({ name: 'Route User', email: 'route-user@gmail.com' }),
+    }),
+  );
+  assert.equal(regReqHttp.status, 200);
+  const regReqJson = await regReqHttp.json();
+  const httpOtp = sent[0].text.match(/\b(\d{6})\b/)[1];
+  assert.equal(JSON.stringify(regReqJson).includes(httpOtp), false);
+
+  const regVerifyHttp = await regVerifyRoute.POST(
+    new Request('https://vistra-learn.vercel.app/api/auth/otp/register/verify', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        origin: 'https://vistra-learn.vercel.app',
+        'sec-fetch-site': 'same-origin',
+        'x-forwarded-for': '203.0.113.10',
+      },
+      body: JSON.stringify({
+        email: 'route-user@gmail.com',
+        otp: httpOtp,
+        challengeId: regReqJson.challengeId,
+      }),
+    }),
+  );
+  assert.equal(regVerifyHttp.status, 201);
+  const setCookie = regVerifyHttp.headers.get('set-cookie') || '';
+  assert.match(setCookie, /vistra_session=/);
+  assert.match(setCookie, /HttpOnly/i);
+  assert.match(setCookie, /SameSite=Lax/i);
+
+  // IP rate limit on login OTP route after 15 requests from same IP
+  for (let i = 0; i < 15; i++) {
+    const r = await loginReqRoute.POST(
+      new Request('https://vistra-learn.vercel.app/api/auth/otp/login/request', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          origin: 'https://vistra-learn.vercel.app',
+          'sec-fetch-site': 'same-origin',
+          'x-forwarded-for': '203.0.113.88',
+        },
+        body: JSON.stringify({ email: `ratelimit-otp-${i}@gmail.com` }),
+      }),
+    );
+    assert.equal(r.status, 200);
+  }
+  const rateBlocked = await loginReqRoute.POST(
+    new Request('https://vistra-learn.vercel.app/api/auth/otp/login/request', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        origin: 'https://vistra-learn.vercel.app',
+        'sec-fetch-site': 'same-origin',
+        'x-forwarded-for': '203.0.113.88',
+      },
+      body: JSON.stringify({ email: 'ratelimit-otp-99@gmail.com' }),
+    }),
+  );
+  assert.equal(rateBlocked.status, 429);
+  assert.ok(loginVerifyRoute.POST);
+});
+
+test('concurrent wrong OTP attempts cap at 5 without consuming valid OTP, and valid OTP still works before lockout', async () => {
+  const memDb = createInMemoryMongoDb();
+  setMongoDbForTests(memDb);
+
+  const sent = [];
+  setEmailTransportForTests(async (p) => {
+    sent.push(p);
+    return { ok: true, id: `cw-${sent.length}` };
+  });
+
+  const t0 = Date.UTC(2026, 10, 27, 16, 0, 0);
+  await registerUserAccount({ name: 'Concurrent User', email: 'cw@gmail.com' });
+  sent.length = 0;
+
+  await requestLoginOtp({ email: 'cw@gmail.com', nowMs: t0 });
+  const realOtp = sent[0].text.match(/\b(\d{6})\b/)[1];
+  const wrongOtp = realOtp === '000000' ? '111111' : '000000';
+
+  // 2 wrong attempts must NOT consume the valid OTP
+  await verifyLoginOtp({ email: 'cw@gmail.com', otp: wrongOtp, nowMs: t0 + 1000 });
+  await verifyLoginOtp({ email: 'cw@gmail.com', otp: wrongOtp, nowMs: t0 + 2000 });
+  assert.equal(memDb.store.emailOtps[0].consumedAt, null);
+  assert.equal(memDb.store.emailOtps[0].attempts, 2);
+
+  // 7 concurrent wrong attempts -> capped at 5, remaining rejected with 429 OTP_LOCKED
+  const burst = await Promise.all(
+    Array.from({ length: 7 }, (_, i) =>
+      verifyLoginOtp({ email: 'cw@gmail.com', otp: wrongOtp, nowMs: t0 + 3000 + i }),
+    ),
+  );
+  assert.equal(memDb.store.emailOtps[0].attempts, 5);
+  assert.equal(burst.every((r) => !r.ok), true);
+  assert.ok(burst.some((r) => r.status === 429 && r.code === 'OTP_LOCKED'));
+
+  // Subsequent valid OTP is rejected because challenge is locked
+  const afterLock = await verifyLoginOtp({ email: 'cw@gmail.com', otp: realOtp, nowMs: t0 + 5000 });
+  assert.equal(afterLock.ok, false);
+  assert.equal(afterLock.status, 429);
+  assert.equal(afterLock.code, 'OTP_LOCKED');
+});
+
+test('concurrent resend requests allow exactly one winner, and email failure releases cooldown for immediate retry', async () => {
+  const memDb = createInMemoryMongoDb();
+  setMongoDbForTests(memDb);
+
+  const sent = [];
+  setEmailTransportForTests(async (p) => {
+    sent.push(p);
+    return { ok: true, id: `resend-${sent.length}` };
+  });
+
+  const t0 = Date.UTC(2026, 10, 27, 16, 10, 0);
+  const parallelReqs = await Promise.all([
+    requestRegistrationOtp({ name: 'Race Reg', email: 'racereg@gmail.com', nowMs: t0 }),
+    requestRegistrationOtp({ name: 'Race Reg', email: 'racereg@gmail.com', nowMs: t0 }),
+    requestRegistrationOtp({ name: 'Race Reg', email: 'racereg@gmail.com', nowMs: t0 }),
+  ]);
+  const winners = parallelReqs.filter((r) => r.ok);
+  const losers = parallelReqs.filter((r) => !r.ok && r.code === 'RESEND_COOLDOWN');
+  assert.equal(winners.length, 1);
+  assert.equal(losers.length, 2);
+  assert.equal(sent.length, 1);
+
+  // Email delivery failure releases cooldown so user can retry immediately
+  setEmailTransportForTests(async () => ({ ok: false, error: 'Temporary Resend outage' }));
+  const failReq = await requestRegistrationOtp({ name: 'Retry User', email: 'retry@gmail.com', nowMs: t0 });
+  assert.equal(failReq.ok, false);
+  assert.equal(failReq.status, 502);
+
+  setEmailTransportForTests(async (p) => {
+    sent.push(p);
+    return { ok: true, id: 'retry-ok' };
+  });
+  const immediateRetry = await requestRegistrationOtp({ name: 'Retry User', email: 'retry@gmail.com', nowMs: t0 + 1000 });
+  assert.equal(immediateRetry.ok, true);
+});
+
+test('login OTP responses are indistinguishable for existing vs unknown emails, and loginVerifyRoute sets secure cookie via HTTP Request', async () => {
+  const memDb = createInMemoryMongoDb();
+  setMongoDbForTests(memDb);
+
+  const sent = [];
+  setEmailTransportForTests(async (p) => {
+    sent.push(p);
+    return { ok: true, id: `eq-${sent.length}` };
+  });
+
+  await registerUserAccount({ name: 'Known User', email: 'known@gmail.com' });
+  sent.length = 0;
+
+  const t0 = Date.UTC(2026, 10, 27, 16, 20, 0);
+
+  // 1st request: both unknown and known return identical status & message
+  const unk1 = await requestLoginOtp({ email: 'unknown@gmail.com', nowMs: t0 });
+  const kwn1 = await requestLoginOtp({ email: 'known@gmail.com', nowMs: t0 });
+  assert.equal(unk1.status, 200);
+  assert.equal(kwn1.status, 200);
+  assert.equal(unk1.message, kwn1.message);
+
+  // 2nd request within 60s: both unknown and known return 429 RESEND_COOLDOWN
+  const unk2 = await requestLoginOtp({ email: 'unknown@gmail.com', nowMs: t0 + 5000 });
+  const kwn2 = await requestLoginOtp({ email: 'known@gmail.com', nowMs: t0 + 5000 });
+  assert.equal(unk2.status, 429);
+  assert.equal(kwn2.status, 429);
+  assert.equal(unk2.code, 'RESEND_COOLDOWN');
+  assert.equal(kwn2.code, 'RESEND_COOLDOWN');
+
+  // Execute loginVerifyRoute.POST with real HTTP Request before superseding challenge
+  const otp = sent[0].text.match(/\b(\d{6})\b/)[1];
+  const verifyHttp = await loginVerifyRoute.POST(
+    new Request('https://vistra-learn.vercel.app/api/auth/otp/login/verify', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        origin: 'https://vistra-learn.vercel.app',
+        'sec-fetch-site': 'same-origin',
+        'x-forwarded-for': '203.0.113.55',
+      },
+      body: JSON.stringify({ email: 'known@gmail.com', otp }),
+    }),
+  );
+  assert.equal(verifyHttp.status, 200);
+  const cookieHeader = verifyHttp.headers.get('set-cookie') || '';
+  assert.match(cookieHeader, /vistra_session=/);
+  assert.match(cookieHeader, /HttpOnly/i);
+  assert.match(cookieHeader, /SameSite=Lax/i);
+
+  // Even if email delivery fails for known user, public response stays neutral 200
+  setEmailTransportForTests(async () => ({ ok: false, restrictedRecipient: true, error: '403' }));
+  const kwnFail = await requestLoginOtp({ email: 'known@gmail.com', nowMs: t0 + 70_000 });
+  assert.equal(kwnFail.status, 200);
+  assert.equal(kwnFail.message, unk1.message);
+});
+
+test('OTP POST routes reject oversized payloads and malformed JSON safely', async () => {
+  const memDb = createInMemoryMongoDb();
+  setMongoDbForTests(memDb);
+
+  const oversized = await loginReqRoute.POST(
+    new Request('https://vistra-learn.vercel.app/api/auth/otp/login/request', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        origin: 'https://vistra-learn.vercel.app',
+        'sec-fetch-site': 'same-origin',
+        'x-forwarded-for': '203.0.113.71',
+      },
+      body: JSON.stringify({ email: 'a'.repeat(3000) + '@gmail.com' }),
+    }),
+  );
+  assert.equal(oversized.status, 413);
+
+  const malformed = await regReqRoute.POST(
+    new Request('https://vistra-learn.vercel.app/api/auth/otp/register/request', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        origin: 'https://vistra-learn.vercel.app',
+        'sec-fetch-site': 'same-origin',
+        'x-forwarded-for': '203.0.113.72',
+      },
+      body: '{"email": "broken@gmail.com"',
+    }),
+  );
+  assert.equal(malformed.status, 400);
+
+  const wrongContentType = await regVerifyRoute.POST(
+    new Request('https://vistra-learn.vercel.app/api/auth/otp/register/verify', {
+      method: 'POST',
+      headers: {
+        'content-type': 'text/plain',
+        origin: 'https://vistra-learn.vercel.app',
+        'sec-fetch-site': 'same-origin',
+        'x-forwarded-for': '203.0.113.73',
+      },
+      body: 'email=test@gmail.com',
+    }),
+  );
+  assert.equal(wrongContentType.status, 415);
+});
+
+const { sanitizeAuthError } = require('../lib/auth/http-error.ts');
+
+test('sanitizeAuthError captures DNS fields without exposing credentials, URIs, or tokens', () => {
+  const dnsErr = Object.assign(new Error('querySrv ENOTFOUND _mongodb._tcp.cluster0.abc12.mongodb.net'), {
+    code: 'ENOTFOUND',
+    syscall: 'querySrv',
+    hostname: '_mongodb._tcp.cluster0.abc12.mongodb.net',
+  });
+  const sanitized = sanitizeAuthError(dnsErr);
+  assert.deepEqual(sanitized, {
+    name: 'Error',
+    code: 'ENOTFOUND',
+    syscall: 'querySrv',
+    hostname: '_mongodb._tcp.cluster0.abc12.mongodb.net',
+  });
+
+  // Never includes message/URIs and strips any accidental userinfo from hostname
+  const leakyErr = Object.assign(new Error('mongodb+srv://admin:supersecret@cluster0.abc12.mongodb.net/vistra'), {
+    code: 'ENOTFOUND',
+    syscall: 'getaddrinfo',
+    hostname: 'admin:supersecret@cluster0.abc12.mongodb.net/vistra',
+  });
+  const cleaned = sanitizeAuthError(leakyErr);
+  assert.equal(cleaned.hostname, 'cluster0.abc12.mongodb.net');
+  assert.equal(JSON.stringify(cleaned).includes('supersecret'), false);
+  assert.equal(JSON.stringify(cleaned).includes('admin'), false);
 });

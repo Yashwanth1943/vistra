@@ -1,4 +1,5 @@
 import { MongoClient, type Collection, type Db } from 'mongodb';
+import { sanitizeAuthError } from './auth/http-error';
 
 export interface UserDocument {
   id: string;
@@ -36,11 +37,26 @@ export interface RateLimitDocument {
   resetAt: Date;
 }
 
+export interface EmailOtpDocument {
+  id: string;
+  purpose: 'register' | 'login';
+  email: string;
+  pendingName?: string;
+  userId?: string;
+  otpHash: string;
+  attempts: number;
+  expiresAt: Date;
+  consumedAt: Date | null;
+  resendAvailableAt: Date;
+  createdAt: Date;
+}
+
 export interface VistraCollections {
   users: Collection<UserDocument>;
   magicLinks: Collection<MagicLinkDocument>;
   sessions: Collection<SessionDocument>;
   rateLimits: Collection<RateLimitDocument>;
+  emailOtps: Collection<EmailOtpDocument>;
 }
 
 declare global {
@@ -77,6 +93,7 @@ export async function getMongoClient(): Promise<MongoClient> {
     });
     globalThis._vistraMongoClientPromise = client.connect().catch((error) => {
       globalThis._vistraMongoClientPromise = undefined;
+      console.error('[mongodb:connect]', sanitizeAuthError(error));
       throw error;
     });
   }
@@ -127,6 +144,9 @@ async function ensureIndexes(db: Db): Promise<void> {
     db.collection<SessionDocument>('sessions').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0, name: 'idx_sessions_expires_ttl' }),
     db.collection<RateLimitDocument>('rateLimits').createIndex({ key: 1 }, { unique: true, name: 'idx_rate_limits_key_unique' }),
     db.collection<RateLimitDocument>('rateLimits').createIndex({ resetAt: 1 }, { expireAfterSeconds: 0, name: 'idx_rate_limits_reset_ttl' }),
+    db.collection<EmailOtpDocument>('emailOtps').createIndex({ id: 1 }, { unique: true, name: 'idx_email_otps_id_unique' }),
+    db.collection<EmailOtpDocument>('emailOtps').createIndex({ email: 1, purpose: 1, createdAt: -1 }, { name: 'idx_email_otps_email_purpose' }),
+    db.collection<EmailOtpDocument>('emailOtps').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 3600, name: 'idx_email_otps_expires_ttl' }),
   ]);
 }
 
@@ -153,5 +173,6 @@ export async function getCollections(): Promise<VistraCollections> {
     magicLinks: db.collection<MagicLinkDocument>('magicLinks'),
     sessions: db.collection<SessionDocument>('sessions'),
     rateLimits: db.collection<RateLimitDocument>('rateLimits'),
+    emailOtps: db.collection<EmailOtpDocument>('emailOtps'),
   };
 }

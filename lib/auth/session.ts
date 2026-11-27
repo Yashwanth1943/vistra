@@ -1,5 +1,6 @@
 import { cookies, headers } from 'next/headers';
 import type { NextResponse } from 'next/server';
+import { sanitizeAuthError } from './http-error';
 import {
   invalidateSessionToken,
   SESSION_COOKIE_NAME,
@@ -58,13 +59,7 @@ export async function getServerSessionResult(): Promise<ServerSessionResult> {
     }
     return { status: 'authenticated', session };
   } catch (error) {
-    console.error('[auth:session]', {
-      name: error instanceof Error ? error.name : 'UnknownError',
-      code:
-        typeof error === 'object' && error !== null && 'code' in error
-          ? String((error as { code?: unknown }).code)
-          : undefined,
-    });
+    console.error('[auth:session]', sanitizeAuthError(error));
     return { status: 'unavailable' };
   }
 }

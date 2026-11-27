@@ -8,6 +8,7 @@ import {
   verifyGoogleIdToken,
   type OAuthTransaction,
 } from '@/lib/auth/google';
+import { sanitizeAuthError } from '@/lib/auth/http-error';
 import { checkRateLimit } from '@/lib/auth/rate-limit';
 import { authenticateWithGoogleProfile, getAppUrl } from '@/lib/auth/service';
 import { getClientIp, setSessionCookie } from '@/lib/auth/session';
@@ -117,13 +118,7 @@ export async function GET(request: Request) {
     setSessionCookie(response, authResult.sessionToken, authResult.sessionExpiresAt);
     return response;
   } catch (error) {
-    console.error('[auth:google-callback]', {
-      name: error instanceof Error ? error.name : 'UnknownError',
-      code:
-        typeof error === 'object' && error !== null && 'code' in error
-          ? String((error as { code?: unknown }).code)
-          : undefined,
-    });
+    console.error('[auth:google-callback]', sanitizeAuthError(error));
     return redirectWithError(
       origin,
       'Google sign-in could not be completed. Please try again.',
