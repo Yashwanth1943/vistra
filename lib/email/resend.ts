@@ -8,6 +8,7 @@ export interface SendEmailPayload {
 export interface SendEmailResult {
   ok: boolean;
   id?: string;
+  restrictedRecipient?: boolean;
   error?: string;
 }
 
@@ -52,6 +53,16 @@ export async function sendEmail(payload: SendEmailPayload): Promise<SendEmailRes
 
     if (!response.ok) {
       const errorText = await response.text().catch(() => '');
+      const isTestSenderRestriction =
+        response.status === 403 &&
+        /verify a domain|your own email address|testing emails/i.test(errorText);
+      if (isTestSenderRestriction) {
+        return {
+          ok: false,
+          restrictedRecipient: true,
+          error: 'Resend test-sender restriction: external recipients require a verified domain.',
+        };
+      }
       return {
         ok: false,
         error: `Email provider returned ${response.status}${errorText ? `: ${errorText.slice(0, 200)}` : ''}`,

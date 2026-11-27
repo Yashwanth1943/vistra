@@ -389,3 +389,20 @@ test('EMAIL_MODE=development restricts emails to RESEND_TEST_RECIPIENT and fails
     process.env.NODE_ENV = prevNodeEnv;
   }
 });
+
+test('Resend test-sender restriction rolls back user and returns clear external-email-unavailable message', async () => {
+  const memDb = createInMemoryMongoDb();
+  setMongoDbForTests(memDb);
+  setEmailTransportForTests(async () => ({
+    ok: false,
+    restrictedRecipient: true,
+    error: 'Resend test-sender restriction: external recipients require a verified domain.',
+  }));
+
+  const res = await registerUserAccount({ name: 'External User', email: 'external@example.com' });
+  assert.equal(res.ok, false);
+  assert.equal(res.status, 403);
+  assert.equal(res.code, 'EXTERNAL_EMAIL_UNAVAILABLE');
+  assert.match(res.message, /External email delivery is not currently available/i);
+  assert.equal(memDb.store.users.length, 0);
+});

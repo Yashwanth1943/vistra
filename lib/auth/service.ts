@@ -59,7 +59,7 @@ export function getEmailModeConfig(): EmailModeConfig {
 export interface RegisterResult {
   ok: boolean;
   status: number;
-  code?: 'INVALID_INPUT' | 'ACCOUNT_EXISTS' | 'EMAIL_FAILED' | 'DEV_RECIPIENT_RESTRICTED' | 'EMAIL_CONFIG_ERROR';
+  code?: 'INVALID_INPUT' | 'ACCOUNT_EXISTS' | 'EMAIL_FAILED' | 'EXTERNAL_EMAIL_UNAVAILABLE' | 'DEV_RECIPIENT_RESTRICTED' | 'EMAIL_CONFIG_ERROR';
   message: string;
   user?: Pick<AuthUser, 'id' | 'name' | 'email' | 'role'>;
 }
@@ -67,7 +67,7 @@ export interface RegisterResult {
 export interface RequestLoginLinkResult {
   ok: boolean;
   status: number;
-  code?: 'INVALID_EMAIL' | 'EMAIL_FAILED' | 'DEV_RECIPIENT_RESTRICTED' | 'EMAIL_CONFIG_ERROR';
+  code?: 'INVALID_EMAIL' | 'EMAIL_FAILED' | 'EXTERNAL_EMAIL_UNAVAILABLE' | 'DEV_RECIPIENT_RESTRICTED' | 'EMAIL_CONFIG_ERROR';
   message: string;
 }
 
@@ -209,6 +209,15 @@ export async function registerUserAccount(input: {
 
   if (!emailResult.ok) {
     await users.deleteOne({ id });
+    if (emailResult.restrictedRecipient) {
+      return {
+        ok: false,
+        status: 403,
+        code: 'EXTERNAL_EMAIL_UNAVAILABLE',
+        message:
+          'External email delivery is not currently available. Only the authorized test account email can receive registration emails right now.',
+      };
+    }
     return {
       ok: false,
       status: 502,
@@ -313,6 +322,15 @@ export async function requestMagicLoginLink(input: {
 
   if (!emailResult.ok) {
     await magicLinks.deleteOne({ id: tokenId });
+    if (emailResult.restrictedRecipient) {
+      return {
+        ok: false,
+        status: 403,
+        code: 'EXTERNAL_EMAIL_UNAVAILABLE',
+        message:
+          'External email delivery is not currently available. Only the authorized test account email can receive sign-in links right now.',
+      };
+    }
     return {
       ok: false,
       status: 502,
