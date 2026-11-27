@@ -55,7 +55,7 @@ export async function sendEmail(payload: SendEmailPayload): Promise<SendEmailRes
       const errorText = await response.text().catch(() => '');
       const isTestSenderRestriction =
         response.status === 403 &&
-        /verify a domain|your own email address|testing emails/i.test(errorText);
+        /verify a domain|verify your domain|domain is not verified|your own email address|testing emails/i.test(errorText);
       if (isTestSenderRestriction) {
         return {
           ok: false,
