@@ -1,6 +1,6 @@
-import { getCollections, type UserDocument } from '../mongodb';
+import { getCollections, type EmailOtpDocument, type UserDocument } from '../mongodb';
 import { sendEmail } from '../email/resend';
-import { buildMagicLinkEmail, buildWelcomeEmail } from '../email/templates';
+import { buildMagicLinkEmail, buildOtpEmail, buildWelcomeEmail } from '../email/templates';
 import {
   generateId,
   generateSecureToken,
@@ -11,6 +11,17 @@ import {
   normalizeName,
 } from './crypto';
 import { ALLOWED_DOMAIN_ERROR_MESSAGE, isAllowedEmailDomain } from './domain-policy';
+import {
+  generateNumericOtp,
+  generateOtpChallengeId,
+  hashOtp,
+  isValidOtpFormat,
+  OTP_MAX_ATTEMPTS,
+  OTP_RESEND_COOLDOWN_MS,
+  OTP_TTL_MS,
+  verifyOtpHashConstantTime,
+} from './otp';
+import { claimOtpCooldown, releaseOtpCooldown } from './rate-limit';
 
 export const MAGIC_LINK_TTL_MS = 10 * 60 * 1000; // 10 minutes
 export const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
@@ -647,6 +658,630 @@ export async function authenticateWithGoogleProfile(
     status: 200,
     user: mapUser(userDoc),
     sessionToken: rawSessionToken,
+    sessionExpiresAt,
+  };
+}
+
+export interface OtpRequestResult {
+  ok: boolean;
+  status: number;
+  code?:
+    | 'INVALID_INPUT'
+    | 'DOMAIN_NOT_ALLOWED'
+    | 'ACCOUNT_EXISTS'
+    | 'RESEND_COOLDOWN'
+    | 'EMAIL_FAILED'
+    | 'EXTERNAL_EMAIL_UNAVAILABLE'
+    | 'DEV_RECIPIENT_RESTRICTED'
+    | 'EMAIL_CONFIG_ERROR';
+  message: string;
+  challengeId?: string;
+  retryAfterSeconds?: number;
+}
+
+export interface OtpVerifyResult {
+  ok: boolean;
+  status: number;
+  code?:
+    | 'INVALID_INPUT'
+    | 'INVALID_OTP'
+    | 'OTP_EXPIRED'
+    | 'OTP_USED'
+    | 'OTP_LOCKED'
+    | 'ACCOUNT_EXISTS';
+  message: string;
+  user?: AuthUser;
+  sessionToken?: string;
+  sessionExpiresAt?: Date;
+}
+
+async function issueSessionForUser(
+  userId: string,
+  nowMs = Date.now(),
+): Promise<{ sessionToken: string; sessionExpiresAt: Date }> {
+  const { sessions } = await getCollections();
+  const rawSessionToken = generateSecureToken();
+  const sessionTokenHash = hashToken(rawSessionToken);
+  const sessionId = generateId();
+  const now = new Date(nowMs);
+  const sessionExpiresAt = new Date(nowMs + SESSION_TTL_MS);
+
+  await sessions.insertOne({
+    id: sessionId,
+    userId,
+    sessionTokenHash,
+    expiresAt: sessionExpiresAt,
+    createdAt: now,
+  });
+
+  return { sessionToken: rawSessionToken, sessionExpiresAt };
+}
+
+export async function requestRegistrationOtp(input: {
+  name: string;
+  email: string;
+  nowMs?: number;
+}): Promise<OtpRequestResult> {
+  const cleanName = normalizeName(input.name ?? '');
+  const cleanEmail = normalizeEmail(input.email ?? '');
+
+  if (!isValidName(cleanName)) {
+    return {
+      ok: false,
+      status: 400,
+      code: 'INVALID_INPUT',
+      message: 'Please enter your full name (between 2 and 80 characters).',
+    };
+  }
+
+  if (!isValidEmail(cleanEmail)) {
+    return {
+      ok: false,
+      status: 400,
+      code: 'INVALID_INPUT',
+      message: 'Please enter a valid email address.',
+    };
+  }
+
+  if (!isAllowedEmailDomain(cleanEmail)) {
+    return {
+      ok: false,
+      status: 403,
+      code: 'DOMAIN_NOT_ALLOWED',
+      message: ALLOWED_DOMAIN_ERROR_MESSAGE,
+    };
+  }
+
+  const emailConfig = getEmailModeConfig();
+  if (!emailConfig.ok) {
+    return {
+      ok: false,
+      status: 503,
+      code: 'EMAIL_CONFIG_ERROR',
+      message: emailConfig.error,
+    };
+  }
+  if (emailConfig.mode === 'development' && cleanEmail !== emailConfig.testRecipient) {
+    return {
+      ok: false,
+      status: 403,
+      code: 'DEV_RECIPIENT_RESTRICTED',
+      message: DEV_MODE_RESTRICTED_MESSAGE,
+    };
+  }
+
+  const { users, emailOtps } = await getCollections();
+  const existingUser = await users.findOne({ email: cleanEmail }, { projection: { id: 1 } });
+  if (existingUser) {
+    return {
+      ok: false,
+      status: 409,
+      code: 'ACCOUNT_EXISTS',
+      message: 'An account with this email address already exists. Please sign in instead.',
+    };
+  }
+
+  const nowMs = input.nowMs ?? Date.now();
+  const cooldown = await claimOtpCooldown('register', cleanEmail, OTP_RESEND_COOLDOWN_MS, nowMs);
+  if (!cooldown.claimed) {
+    return {
+      ok: false,
+      status: 429,
+      code: 'RESEND_COOLDOWN',
+      retryAfterSeconds: cooldown.retryAfterSeconds,
+      message: `Please wait ${cooldown.retryAfterSeconds} seconds before requesting a new verification code.`,
+    };
+  }
+
+  await emailOtps.deleteMany({ email: cleanEmail, purpose: 'register', consumedAt: null });
+
+  const challengeId = generateOtpChallengeId();
+  const otp = generateNumericOtp();
+  const otpHash = hashOtp({ purpose: 'register', email: cleanEmail, challengeId, otp });
+  const now = new Date(nowMs);
+
+  const challengeDoc: EmailOtpDocument = {
+    id: challengeId,
+    purpose: 'register',
+    email: cleanEmail,
+    pendingName: cleanName,
+    otpHash,
+    attempts: 0,
+    expiresAt: new Date(nowMs + OTP_TTL_MS),
+    consumedAt: null,
+    resendAvailableAt: new Date(nowMs + OTP_RESEND_COOLDOWN_MS),
+    createdAt: now,
+  };
+
+  await emailOtps.insertOne(challengeDoc);
+
+  const emailContent = buildOtpEmail({
+    name: cleanName,
+    otp,
+    purpose: 'register',
+    expiresInMinutes: 5,
+  });
+
+  const emailResult = await sendEmail({
+    to: cleanEmail,
+    subject: emailContent.subject,
+    text: emailContent.text,
+    html: emailContent.html,
+  });
+
+  if (!emailResult.ok) {
+    await emailOtps.deleteOne({ id: challengeId });
+    await releaseOtpCooldown('register', cleanEmail);
+    if (emailResult.restrictedRecipient) {
+      return {
+        ok: false,
+        status: 403,
+        code: 'EXTERNAL_EMAIL_UNAVAILABLE',
+        message:
+          'External email delivery is not currently available. Only the authorized test account email can receive verification codes right now.',
+      };
+    }
+    return {
+      ok: false,
+      status: 502,
+      code: 'EMAIL_FAILED',
+      message: 'We could not deliver your verification code right now. Please try again shortly.',
+    };
+  }
+
+  return {
+    ok: true,
+    status: 200,
+    challengeId,
+    message: 'A 6-digit verification code has been sent to your email address.',
+  };
+}
+
+export async function verifyRegistrationOtp(input: {
+  email: string;
+  otp: string;
+  challengeId?: string;
+  nowMs?: number;
+}): Promise<OtpVerifyResult> {
+  const cleanEmail = normalizeEmail(input.email ?? '');
+  const cleanOtp = (input.otp ?? '').trim();
+  const cleanChallengeId = input.challengeId?.trim();
+
+  if (!isValidEmail(cleanEmail) || !isValidOtpFormat(cleanOtp)) {
+    return {
+      ok: false,
+      status: 400,
+      code: 'INVALID_INPUT',
+      message: 'Please enter a valid email address and 6-digit verification code.',
+    };
+  }
+
+  const { users, emailOtps } = await getCollections();
+  const nowMs = input.nowMs ?? Date.now();
+  const now = new Date(nowMs);
+
+  const filter = cleanChallengeId
+    ? { id: cleanChallengeId, email: cleanEmail, purpose: 'register' as const }
+    : { email: cleanEmail, purpose: 'register' as const, consumedAt: null };
+
+  const challenge = await emailOtps.findOne(filter);
+  if (!challenge) {
+    return {
+      ok: false,
+      status: 401,
+      code: 'INVALID_OTP',
+      message: 'Invalid verification code. Please request a new code.',
+    };
+  }
+
+  if (challenge.consumedAt) {
+    return {
+      ok: false,
+      status: 401,
+      code: 'OTP_USED',
+      message: 'This verification code has already been used. Please request a new code.',
+    };
+  }
+
+  if (challenge.expiresAt.getTime() <= nowMs) {
+    return {
+      ok: false,
+      status: 401,
+      code: 'OTP_EXPIRED',
+      message: 'This verification code has expired. Codes are valid for 5 minutes.',
+    };
+  }
+
+  if (challenge.attempts >= OTP_MAX_ATTEMPTS) {
+    return {
+      ok: false,
+      status: 429,
+      code: 'OTP_LOCKED',
+      message: 'Too many incorrect attempts. Please request a new verification code.',
+    };
+  }
+
+  const candidateHash = hashOtp({
+    purpose: 'register',
+    email: cleanEmail,
+    challengeId: challenge.id,
+    otp: cleanOtp,
+  });
+
+  if (!verifyOtpHashConstantTime(challenge.otpHash, candidateHash)) {
+    const updated = await emailOtps.findOneAndUpdate(
+      { id: challenge.id, consumedAt: null, attempts: { $lt: OTP_MAX_ATTEMPTS } },
+      { $inc: { attempts: 1 } },
+      { returnDocument: 'after' },
+    );
+    const attempts = updated?.attempts ?? OTP_MAX_ATTEMPTS;
+    if (attempts >= OTP_MAX_ATTEMPTS) {
+      return {
+        ok: false,
+        status: 429,
+        code: 'OTP_LOCKED',
+        message: 'Too many incorrect attempts. Please request a new verification code.',
+      };
+    }
+    return {
+      ok: false,
+      status: 401,
+      code: 'INVALID_OTP',
+      message: 'Invalid verification code. Please check the 6-digit code and try again.',
+    };
+  }
+
+  // Atomic single-use OTP consumption
+  const consumed = await emailOtps.findOneAndUpdate(
+    {
+      id: challenge.id,
+      email: cleanEmail,
+      purpose: 'register',
+      consumedAt: null,
+      expiresAt: { $gt: now },
+      attempts: { $lt: OTP_MAX_ATTEMPTS },
+    },
+    { $set: { consumedAt: now } },
+    { returnDocument: 'after' },
+  );
+
+  if (!consumed || !consumed.pendingName) {
+    return {
+      ok: false,
+      status: 401,
+      code: 'OTP_USED',
+      message: 'This verification code is no longer valid. Please request a new code.',
+    };
+  }
+
+  const userId = generateId();
+  const userDoc: UserDocument = {
+    id: userId,
+    name: consumed.pendingName,
+    email: cleanEmail,
+    emailVerifiedAt: now,
+    role: DEFAULT_USER_ROLE,
+    authProviders: ['email-otp'],
+    avatarUrl: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  try {
+    await users.insertOne(userDoc);
+  } catch (error) {
+    if (isDuplicateKeyError(error)) {
+      return {
+        ok: false,
+        status: 409,
+        code: 'ACCOUNT_EXISTS',
+        message: 'An account with this email address already exists. Please sign in instead.',
+      };
+    }
+    throw error;
+  }
+
+  const { sessionToken, sessionExpiresAt } = await issueSessionForUser(userDoc.id, nowMs);
+
+  return {
+    ok: true,
+    status: 201,
+    message: 'Your Vistra Learn account has been verified and created.',
+    user: mapUser(userDoc),
+    sessionToken,
+    sessionExpiresAt,
+  };
+}
+
+export async function requestLoginOtp(input: {
+  email: string;
+  nowMs?: number;
+}): Promise<OtpRequestResult> {
+  const cleanEmail = normalizeEmail(input.email ?? '');
+  if (!isValidEmail(cleanEmail)) {
+    return {
+      ok: false,
+      status: 400,
+      code: 'INVALID_INPUT',
+      message: 'Please enter a valid email address.',
+    };
+  }
+
+  const emailConfig = getEmailModeConfig();
+  if (!emailConfig.ok) {
+    return {
+      ok: false,
+      status: 503,
+      code: 'EMAIL_CONFIG_ERROR',
+      message: emailConfig.error,
+    };
+  }
+  if (emailConfig.mode === 'development' && cleanEmail !== emailConfig.testRecipient) {
+    return {
+      ok: false,
+      status: 403,
+      code: 'DEV_RECIPIENT_RESTRICTED',
+      message: DEV_MODE_RESTRICTED_MESSAGE,
+    };
+  }
+
+  const neutralMessage =
+    'If an account exists for this email address, a 6-digit sign-in code has been sent.';
+
+  const nowMs = input.nowMs ?? Date.now();
+  const cooldown = await claimOtpCooldown('login', cleanEmail, OTP_RESEND_COOLDOWN_MS, nowMs);
+  if (!cooldown.claimed) {
+    return {
+      ok: false,
+      status: 429,
+      code: 'RESEND_COOLDOWN',
+      retryAfterSeconds: cooldown.retryAfterSeconds,
+      message: `Please wait ${cooldown.retryAfterSeconds} seconds before requesting a new sign-in code.`,
+    };
+  }
+
+  const { users, emailOtps } = await getCollections();
+  const user = await users.findOne({ email: cleanEmail });
+  if (!user) {
+    return {
+      ok: true,
+      status: 200,
+      message: neutralMessage,
+    };
+  }
+
+  await emailOtps.deleteMany({ email: cleanEmail, purpose: 'login', consumedAt: null });
+
+  const challengeId = generateOtpChallengeId();
+  const otp = generateNumericOtp();
+  const otpHash = hashOtp({ purpose: 'login', email: cleanEmail, challengeId, otp });
+  const now = new Date(nowMs);
+
+  await emailOtps.insertOne({
+    id: challengeId,
+    purpose: 'login',
+    email: cleanEmail,
+    userId: user.id,
+    otpHash,
+    attempts: 0,
+    expiresAt: new Date(nowMs + OTP_TTL_MS),
+    consumedAt: null,
+    resendAvailableAt: new Date(nowMs + OTP_RESEND_COOLDOWN_MS),
+    createdAt: now,
+  });
+
+  const emailContent = buildOtpEmail({
+    name: user.name,
+    otp,
+    purpose: 'login',
+    expiresInMinutes: 5,
+  });
+
+  const emailResult = await sendEmail({
+    to: user.email,
+    subject: emailContent.subject,
+    text: emailContent.text,
+    html: emailContent.html,
+  });
+
+  if (!emailResult.ok) {
+    await emailOtps.deleteOne({ id: challengeId });
+    await releaseOtpCooldown('login', cleanEmail);
+    console.error('[auth:otp-login-email]', {
+      restrictedRecipient: Boolean(emailResult.restrictedRecipient),
+    });
+    return {
+      ok: true,
+      status: 200,
+      message: neutralMessage,
+    };
+  }
+
+  return {
+    ok: true,
+    status: 200,
+    message: neutralMessage,
+  };
+}
+
+export async function verifyLoginOtp(input: {
+  email: string;
+  otp: string;
+  challengeId?: string;
+  nowMs?: number;
+}): Promise<OtpVerifyResult> {
+  const cleanEmail = normalizeEmail(input.email ?? '');
+  const cleanOtp = (input.otp ?? '').trim();
+  const cleanChallengeId = input.challengeId?.trim();
+
+  if (!isValidEmail(cleanEmail) || !isValidOtpFormat(cleanOtp)) {
+    return {
+      ok: false,
+      status: 400,
+      code: 'INVALID_INPUT',
+      message: 'Please enter a valid email address and 6-digit verification code.',
+    };
+  }
+
+  const { users, emailOtps } = await getCollections();
+  const nowMs = input.nowMs ?? Date.now();
+  const now = new Date(nowMs);
+
+  const filter = cleanChallengeId
+    ? { id: cleanChallengeId, email: cleanEmail, purpose: 'login' as const }
+    : { email: cleanEmail, purpose: 'login' as const, consumedAt: null };
+
+  const challenge = await emailOtps.findOne(filter);
+  if (!challenge) {
+    return {
+      ok: false,
+      status: 401,
+      code: 'INVALID_OTP',
+      message: 'Invalid verification code. Please request a new code.',
+    };
+  }
+
+  if (challenge.consumedAt) {
+    return {
+      ok: false,
+      status: 401,
+      code: 'OTP_USED',
+      message: 'This verification code has already been used. Please request a new code.',
+    };
+  }
+
+  if (challenge.expiresAt.getTime() <= nowMs) {
+    return {
+      ok: false,
+      status: 401,
+      code: 'OTP_EXPIRED',
+      message: 'This verification code has expired. Codes are valid for 5 minutes.',
+    };
+  }
+
+  if (challenge.attempts >= OTP_MAX_ATTEMPTS) {
+    return {
+      ok: false,
+      status: 429,
+      code: 'OTP_LOCKED',
+      message: 'Too many incorrect attempts. Please request a new verification code.',
+    };
+  }
+
+  const candidateHash = hashOtp({
+    purpose: 'login',
+    email: cleanEmail,
+    challengeId: challenge.id,
+    otp: cleanOtp,
+  });
+
+  if (!verifyOtpHashConstantTime(challenge.otpHash, candidateHash)) {
+    const updated = await emailOtps.findOneAndUpdate(
+      { id: challenge.id, consumedAt: null, attempts: { $lt: OTP_MAX_ATTEMPTS } },
+      { $inc: { attempts: 1 } },
+      { returnDocument: 'after' },
+    );
+    const attempts = updated?.attempts ?? OTP_MAX_ATTEMPTS;
+    if (attempts >= OTP_MAX_ATTEMPTS) {
+      return {
+        ok: false,
+        status: 429,
+        code: 'OTP_LOCKED',
+        message: 'Too many incorrect attempts. Please request a new verification code.',
+      };
+    }
+    return {
+      ok: false,
+      status: 401,
+      code: 'INVALID_OTP',
+      message: 'Invalid verification code. Please check the 6-digit code and try again.',
+    };
+  }
+
+  // Atomic single-use OTP consumption
+  const consumed = await emailOtps.findOneAndUpdate(
+    {
+      id: challenge.id,
+      email: cleanEmail,
+      purpose: 'login',
+      consumedAt: null,
+      expiresAt: { $gt: now },
+      attempts: { $lt: OTP_MAX_ATTEMPTS },
+    },
+    { $set: { consumedAt: now } },
+    { returnDocument: 'after' },
+  );
+
+  if (!consumed || !consumed.userId) {
+    return {
+      ok: false,
+      status: 401,
+      code: 'OTP_USED',
+      message: 'This verification code is no longer valid. Please request a new code.',
+    };
+  }
+
+  const existingUser = await users.findOne({ id: consumed.userId });
+  if (!existingUser) {
+    return {
+      ok: false,
+      status: 401,
+      code: 'INVALID_OTP',
+      message: 'Account could not be found for this verification code.',
+    };
+  }
+
+  // Preserve existing user ID, role, googleSub, and existing authProviders.
+  const existingProviders =
+    Array.isArray(existingUser.authProviders) && existingUser.authProviders.length > 0
+      ? existingUser.authProviders
+      : existingUser.googleSub
+        ? ['google']
+        : ['email'];
+  const mergedProviders = existingProviders.includes('email-otp')
+    ? existingProviders
+    : [...existingProviders, 'email-otp'];
+
+  await users.updateOne(
+    { id: existingUser.id },
+    {
+      $set: {
+        authProviders: mergedProviders,
+        emailVerifiedAt: existingUser.emailVerifiedAt ?? now,
+        updatedAt: now,
+      },
+    },
+  );
+
+  const updatedUser = (await users.findOne({ id: existingUser.id })) ?? existingUser;
+  const { sessionToken, sessionExpiresAt } = await issueSessionForUser(updatedUser.id, nowMs);
+
+  return {
+    ok: true,
+    status: 200,
+    message: 'Signed in to Vistra Learn.',
+    user: mapUser(updatedUser),
+    sessionToken,
     sessionExpiresAt,
   };
 }

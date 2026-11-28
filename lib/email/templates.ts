@@ -135,3 +135,77 @@ export function buildMagicLinkEmail({
 
   return { subject, text, html };
 }
+
+export interface OtpEmailTemplateInput {
+  name: string;
+  otp: string;
+  purpose: 'register' | 'login';
+  expiresInMinutes: number;
+}
+
+export function buildOtpEmail({
+  name,
+  otp,
+  purpose,
+  expiresInMinutes,
+}: OtpEmailTemplateInput): EmailMessage {
+  const safeName = escapeHtml(name);
+  const safeOtp = escapeHtml(otp);
+  const isRegister = purpose === 'register';
+  const subject = isRegister
+    ? 'Verify your Vistra Learn email'
+    : 'Your Vistra Learn sign-in code';
+  const actionLine = isRegister
+    ? 'Use the verification code below to complete your Vistra Learn registration:'
+    : 'Use the verification code below to sign in to your Vistra Learn account:';
+
+  const text = [
+    `Hi ${name},`,
+    '',
+    actionLine,
+    '',
+    otp,
+    '',
+    `This 6-digit code expires in ${expiresInMinutes} minutes and can only be used once.`,
+    'Security warning: Never share this code with anyone. Vistra Learn will never ask for it over chat or phone.',
+    '',
+    'See beyond the code.',
+    '',
+    '— Team Vistra Learn',
+  ].join('\n');
+
+  const html = `<!doctype html>
+<html lang="en">
+  <body style="margin:0;padding:32px 16px;background:#F8FAFC;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#0F0F1A;">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:540px;margin:0 auto;background:#FFFFFF;border:1px solid #E2E8F0;border-radius:16px;overflow:hidden;">
+      <tr>
+        <td style="padding:28px 32px 16px;border-bottom:1px solid #F1F5F9;">
+          <div style="font-size:20px;font-weight:700;letter-spacing:-0.4px;color:#0F0F1A;">
+            <span style="color:#6D28D9;">V</span>istra <span style="font-weight:500;color:#64748B;font-size:15px;">Learn</span>
+          </div>
+          <div style="font-size:12px;color:#64748B;margin-top:2px;">See beyond the code.</div>
+        </td>
+      </tr>
+      <tr>
+        <td style="padding:28px 32px;">
+          <p style="margin:0 0 14px;font-size:15px;line-height:1.6;">Hi ${safeName},</p>
+          <p style="margin:0 0 20px;font-size:15px;line-height:1.6;color:#334155;">${actionLine}</p>
+          <div style="margin:0 0 20px;padding:16px 20px;border-radius:12px;background:#F3F0FF;border:1px solid #DDD6FE;text-align:center;">
+            <span style="font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:30px;font-weight:700;letter-spacing:8px;color:#4C1D95;">${safeOtp}</span>
+          </div>
+          <p style="margin:0 0 12px;font-size:13px;line-height:1.5;color:#64748B;">
+            This 6-digit code expires in ${expiresInMinutes} minutes and can only be used once.
+          </p>
+          <p style="margin:0 0 18px;font-size:12.5px;line-height:1.5;color:#991B1B;background:#FEF2F2;border:1px solid #FECACA;border-radius:8px;padding:10px 12px;">
+            Security warning: Do not share this code with anyone. Team Vistra Learn will never ask for this code.
+          </p>
+          <p style="margin:0 0 4px;font-size:14px;font-weight:600;color:#6D28D9;">See beyond the code.</p>
+          <p style="margin:0;font-size:14px;color:#475569;">— Team Vistra Learn</p>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>`;
+
+  return { subject, text, html };
+}
