@@ -346,8 +346,10 @@ export function VistraAppShell({ currentUser }: { currentUser: AuthenticatedUser
   return <div className="app-shell">
     <a href="#main-content" className="skip-link">Skip to main content</a>
     <aside className={`sidebar ${showMobileNav?'sidebar-open':''}`} aria-label="Primary navigation">
-      <div className="sidebar-top">
+      <div className="sidebar-header">
         <div className="brand"><button type="button" className="brand-button" onClick={()=>{setActiveTab('Overview');setShowMobileNav(false)}} aria-label="Vistra home"><VistraLogo variant="full" size={32} decorative/></button><button className="mobile-close" onClick={()=>setShowMobileNav(false)} aria-label="Close menu"><X size={18}/></button></div>
+      </div>
+      <div className="sidebar-top">
         <div className="sidebar-section-label">Explore</div>
         <nav className="side-nav" aria-label="Explore">
           {exploreNav.map(item => <button key={item.name} aria-current={activeTab===item.name?'page':undefined} className={`nav-item ${activeTab===item.name?'active':''}`} onClick={()=>{setActiveTab(item.name);setShowMobileNav(false)}}><item.icon size={15}/><span>{item.label}</span></button>)}

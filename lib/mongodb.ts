@@ -61,6 +61,14 @@ export interface StudentProgressDocument {
   updatedAt: Date;
 }
 
+export interface FeedbackDocument {
+  category: 'Confusing behavior' | 'Bug report' | 'Feature idea' | 'Content feedback';
+  lab: string;
+  description: string;
+  userId: string | null;
+  createdAt: Date;
+}
+
 export interface VistraCollections {
   users: Collection<UserDocument>;
   magicLinks: Collection<MagicLinkDocument>;
@@ -68,6 +76,7 @@ export interface VistraCollections {
   rateLimits: Collection<RateLimitDocument>;
   emailOtps: Collection<EmailOtpDocument>;
   studentProgress: Collection<StudentProgressDocument>;
+  feedback: Collection<FeedbackDocument>;
 }
 
 declare global {
@@ -159,6 +168,8 @@ async function ensureIndexes(db: Db): Promise<void> {
     db.collection<EmailOtpDocument>('emailOtps').createIndex({ email: 1, purpose: 1, createdAt: -1 }, { name: 'idx_email_otps_email_purpose' }),
     db.collection<EmailOtpDocument>('emailOtps').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 3600, name: 'idx_email_otps_expires_ttl' }),
     db.collection<StudentProgressDocument>('studentProgress').createIndex({ userId: 1 }, { unique: true, name: 'idx_student_progress_user_id_unique' }),
+    db.collection<FeedbackDocument>('feedback').createIndex({ createdAt: -1 }, { name: 'idx_feedback_created_at' }),
+    db.collection<FeedbackDocument>('feedback').createIndex({ userId: 1, createdAt: -1 }, { name: 'idx_feedback_user_created_at' }),
   ]);
 }
 
@@ -187,5 +198,6 @@ export async function getCollections(): Promise<VistraCollections> {
     rateLimits: db.collection<RateLimitDocument>('rateLimits'),
     emailOtps: db.collection<EmailOtpDocument>('emailOtps'),
     studentProgress: db.collection<StudentProgressDocument>('studentProgress'),
+    feedback: db.collection<FeedbackDocument>('feedback'),
   };
 }

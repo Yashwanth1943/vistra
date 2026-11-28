@@ -98,7 +98,7 @@ function applyUpdate(doc, update) {
 }
 
 function createInMemoryMongoDb() {
-  const store = { users: [], magicLinks: [], sessions: [], rateLimits: [], emailOtps: [], studentProgress: [] };
+  const store = { users: [], magicLinks: [], sessions: [], rateLimits: [], emailOtps: [], studentProgress: [], feedback: [] };
   const uniqueFields = {
     users: ['email', 'id'],
     magicLinks: ['tokenHash'],
@@ -123,8 +123,30 @@ function createInMemoryMongoDb() {
             throw err;
           }
         }
-        docs.push({ ...doc });
-        return { acknowledged: true };
+        const insertedId = doc._id ?? `mem-${name}-${docs.length + 1}`;
+        docs.push({ _id: insertedId, ...doc });
+        return { acknowledged: true, insertedId };
+      },
+      find(filter = {}) {
+        let matched = docs.filter((d) => matchesFilter(d, filter)).map((d) => ({ ...d }));
+        return {
+          sort(spec) {
+            const [[field, dir]] = Object.entries(spec);
+            matched.sort((a, b) => {
+              const av = a[field] instanceof Date ? a[field].getTime() : a[field];
+              const bv = b[field] instanceof Date ? b[field].getTime() : b[field];
+              return dir < 0 ? (bv > av ? 1 : bv < av ? -1 : 0) : (av > bv ? 1 : av < bv ? -1 : 0);
+            });
+            return this;
+          },
+          limit(n) {
+            matched = matched.slice(0, n);
+            return this;
+          },
+          async toArray() {
+            return matched;
+          },
+        };
       },
       async updateOne(filter, update, opts = {}) {
         const found = docs.find((d) => matchesFilter(d, filter));
@@ -1554,4 +1576,164 @@ test('workspace hydration fails safely on 503 or network error and never trigger
     shouldPersistWorkspaceProgress({ authenticated: false, hydrated: true, revision: 1, savedRevision: 0 }),
     false,
   );
+});
+
+test('feedback API stores guest and authenticated feedback in MongoDB with validation, CSRF, and rate limiting', async () => {
+  const memDb = createInMemoryMongoDb();
+  setMongoDbForTests(memDb);
+
+  const { setCookieStoreForTests } = require('../lib/auth/session.ts');
+  let activeCookieToken = null;
+  setCookieStoreForTests(async () => ({
+    get: (name) =>
+      name === 'vistra_session' && activeCookieToken
+        ? { value: activeCookieToken }
+        : undefined,
+  }));
+
+  try {
+    const feedbackRoute = require('../app/api/feedback/route.ts');
+
+    // 1. Cross-origin POST is rejected
+    const crossOrigin = await feedbackRoute.POST(
+      new Request('https://vistra-learn.vercel.app/api/feedback', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          origin: 'https://evil.example',
+          'sec-fetch-site': 'cross-site',
+          'x-forwarded-for': '203.0.113.80',
+        },
+        body: JSON.stringify({ category: 'Bug report', lab: 'Flexbox lab', description: 'Test' }),
+      }),
+    );
+    assert.equal(crossOrigin.status, 403);
+
+    // 2. Invalid category and empty lab are rejected
+    const badCat = await feedbackRoute.POST(
+      new Request('https://vistra-learn.vercel.app/api/feedback', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          origin: 'https://vistra-learn.vercel.app',
+          'sec-fetch-site': 'same-origin',
+          'x-forwarded-for': '203.0.113.80',
+        },
+        body: JSON.stringify({ category: 'Invalid', lab: 'Flexbox lab', description: 'Hi' }),
+      }),
+    );
+    assert.equal(badCat.status, 400);
+
+    const badLab = await feedbackRoute.POST(
+      new Request('https://vistra-learn.vercel.app/api/feedback', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          origin: 'https://vistra-learn.vercel.app',
+          'sec-fetch-site': 'same-origin',
+          'x-forwarded-for': '203.0.113.80',
+        },
+        body: JSON.stringify({ category: 'Bug report', lab: '   ', description: 'Hi' }),
+      }),
+    );
+    assert.equal(badLab.status, 400);
+
+    // 3. Guest submission succeeds with userId: null even if body attempts to forge userId
+    const guestRes = await feedbackRoute.POST(
+      new Request('https://vistra-learn.vercel.app/api/feedback', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          origin: 'https://vistra-learn.vercel.app',
+          'sec-fetch-site': 'same-origin',
+          'x-forwarded-for': '203.0.113.81',
+        },
+        body: JSON.stringify({
+          userId: 'forged-user-id',
+          category: 'Content feedback',
+          lab: 'Box model',
+          description: 'Very clear diagram!',
+        }),
+      }),
+    );
+    assert.equal(guestRes.status, 201);
+    assert.equal(memDb.store.feedback.length, 1);
+    assert.equal(memDb.store.feedback[0].userId, null);
+    assert.equal(memDb.store.feedback[0].lab, 'Box model');
+
+    // Guest GET returns empty list (cannot read centralized feedback)
+    const guestGet = await feedbackRoute.GET();
+    assert.equal(guestGet.status, 200);
+    const guestGetJson = await guestGet.json();
+    assert.deepEqual(guestGetJson.feedback, []);
+
+    // 4. Guest rate limit blocks after 5 submissions from same IP
+    for (let i = 0; i < 4; i++) {
+      const okRes = await feedbackRoute.POST(
+        new Request('https://vistra-learn.vercel.app/api/feedback', {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            origin: 'https://vistra-learn.vercel.app',
+            'sec-fetch-site': 'same-origin',
+            'x-forwarded-for': '203.0.113.81',
+          },
+          body: JSON.stringify({ category: 'Feature idea', lab: 'Grid lab', description: `Note ${i}` }),
+        }),
+      );
+      assert.equal(okRes.status, 201);
+    }
+    const rateLimited = await feedbackRoute.POST(
+      new Request('https://vistra-learn.vercel.app/api/feedback', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          origin: 'https://vistra-learn.vercel.app',
+          'sec-fetch-site': 'same-origin',
+          'x-forwarded-for': '203.0.113.81',
+        },
+        body: JSON.stringify({ category: 'Feature idea', lab: 'Grid lab', description: 'Too many' }),
+      }),
+    );
+    assert.equal(rateLimited.status, 429);
+
+    // 5. Authenticated submission stores verified session.user.id and GET returns only own feedback
+    const authUser = await authenticateWithGoogleProfile({
+      sub: 'google-fb-user',
+      email: 'fbstudent@gmail.com',
+      emailVerified: true,
+      name: 'Feedback Student',
+      picture: null,
+    });
+    assert.equal(authUser.ok, true);
+    activeCookieToken = authUser.sessionToken;
+
+    const authPost = await feedbackRoute.POST(
+      new Request('https://vistra-learn.vercel.app/api/feedback', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          origin: 'https://vistra-learn.vercel.app',
+          'sec-fetch-site': 'same-origin',
+          'x-forwarded-for': '203.0.113.82',
+        },
+        body: JSON.stringify({
+          userId: 'forged-other-id',
+          category: 'Bug report',
+          lab: 'Playground',
+          description: 'Line wrap glitch',
+        }),
+      }),
+    );
+    assert.equal(authPost.status, 201);
+
+    const authGet = await feedbackRoute.GET();
+    assert.equal(authGet.status, 200);
+    const authGetJson = await authGet.json();
+    assert.equal(authGetJson.feedback.length, 1);
+    assert.equal(authGetJson.feedback[0].lab, 'Playground');
+    assert.equal(memDb.store.feedback.at(-1).userId, authUser.user.id);
+  } finally {
+    setCookieStoreForTests(null);
+  }
 });

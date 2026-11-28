@@ -52,7 +52,29 @@ export function StudentWorkspace({
     setProjects(readBuilderProjects());
     setDebugExps(readDebugExperiments());
     setDraft(readPlaygroundDraft());
-    setFeedbackList(readFeedback());
+
+    const localFeedback = readFeedback();
+    setFeedbackList(localFeedback);
+
+    let cancelled = false;
+    fetch('/api/feedback', { cache: 'no-store' })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (cancelled || !data?.ok || !Array.isArray(data.feedback)) return;
+        const remoteEntries = data.feedback as FeedbackEntry[];
+        if (remoteEntries.length === 0) return;
+        const seen = new Set(remoteEntries.map((item) => item.id));
+        const merged = [
+          ...remoteEntries,
+          ...localFeedback.filter((item) => !seen.has(item.id)),
+        ];
+        setFeedbackList(merged);
+      })
+      .catch(() => {});
+
+    return () => {
+      cancelled = true;
+    };
   }, [initialSection]);
 
   const savedExperimentsSection = (

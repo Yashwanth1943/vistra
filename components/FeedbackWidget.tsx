@@ -2,14 +2,10 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { Check, MessageSquare, X } from 'lucide-react';
-import { submitFeedback, type FeedbackCategory } from '../app/student-store';
+import { type FeedbackCategory } from '../app/student-store';
+import { FEEDBACK_CATEGORIES, FEEDBACK_MAX_DESCRIPTION_LENGTH } from '@/lib/feedback';
 
-const CATEGORIES: FeedbackCategory[] = [
-  'Confusing behavior',
-  'Bug report',
-  'Feature idea',
-  'Content feedback',
-];
+const CATEGORIES: FeedbackCategory[] = [...FEEDBACK_CATEGORIES];
 
 export function FeedbackModal({
   activeLab,
@@ -20,6 +16,8 @@ export function FeedbackModal({
 }) {
   const [category, setCategory] = useState<FeedbackCategory>('Confusing behavior');
   const [description, setDescription] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [submitted, setSubmitted] = useState(false);
   const closeBtnRef = useRef<HTMLButtonElement>(null);
   const cardRef = useRef<HTMLDivElement>(null);
@@ -46,19 +44,42 @@ export function FeedbackModal({
   useEffect(() => {
     closeBtnRef.current?.focus();
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
+      if (e.key === 'Escape' && !submitting) {
         e.preventDefault();
         onClose();
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [onClose]);
+  }, [onClose, submitting]);
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    submitFeedback(category, activeLab, description);
-    setSubmitted(true);
+    if (submitting) return;
+
+    setSubmitting(true);
+    setError(null);
+    try {
+      const res = await fetch('/api/feedback', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          category,
+          lab: activeLab,
+          description,
+        }),
+      });
+      const data = (await res.json().catch(() => null)) as { ok?: boolean; message?: string } | null;
+      if (!res.ok || !data?.ok) {
+        setError(data?.message || 'Unable to submit feedback right now. Please try again.');
+        return;
+      }
+      setSubmitted(true);
+    } catch {
+      setError('Unable to reach the server. Please check your connection and try again.');
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   return (
@@ -68,7 +89,14 @@ export function FeedbackModal({
           <h2 id="feedback-modal-title">
             <MessageSquare size={16} /> Lab Feedback
           </h2>
-          <button ref={closeBtnRef} type="button" className="ws-icon-btn" onClick={onClose} aria-label="Close feedback dialog">
+          <button
+            ref={closeBtnRef}
+            type="button"
+            className="ws-icon-btn"
+            onClick={onClose}
+            disabled={submitting}
+            aria-label="Close feedback dialog"
+          >
             <X size={16} />
           </button>
         </div>
@@ -78,7 +106,7 @@ export function FeedbackModal({
             <Check size={20} />
             <div>
               <strong>Feedback recorded for {activeLab}.</strong>
-              <p>Thank you! Your note is saved locally in your Student Workspace.</p>
+              <p>Thank you! Your feedback has been submitted.</p>
             </div>
             <button type="button" className="primary-button" onClick={onClose}>
               Done
@@ -90,6 +118,12 @@ export function FeedbackModal({
               Active experiment: <code>{activeLab}</code>
             </div>
 
+            {error ? (
+              <div className="auth-alert auth-alert--error" role="alert">
+                {error}
+              </div>
+            ) : null}
+
             <label className="viz-control">
               <div className="viz-control-head">
                 <span>Feedback category</span>
@@ -98,6 +132,7 @@ export function FeedbackModal({
                 aria-label="Feedback category"
                 value={category}
                 onChange={(e) => setCategory(e.target.value as FeedbackCategory)}
+                disabled={submitting}
               >
                 {CATEGORIES.map((c) => (
                   <option key={c} value={c}>
@@ -114,18 +149,20 @@ export function FeedbackModal({
               <textarea
                 aria-label="Feedback description"
                 rows={3}
+                maxLength={FEEDBACK_MAX_DESCRIPTION_LENGTH}
                 placeholder="What felt confusing, broken, or helpful in this lab?"
                 value={description}
                 onChange={(e) => setDescription(e.target.value)}
+                disabled={submitting}
               />
             </label>
 
             <div className="modal-actions">
-              <button type="button" className="reset-button" onClick={onClose}>
+              <button type="button" className="reset-button" onClick={onClose} disabled={submitting}>
                 Cancel
               </button>
-              <button type="submit" className="primary-button">
-                Submit feedback
+              <button type="submit" className="primary-button" disabled={submitting}>
+                {submitting ? 'Submitting…' : 'Submit feedback'}
               </button>
             </div>
           </form>

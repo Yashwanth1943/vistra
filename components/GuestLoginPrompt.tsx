@@ -20,20 +20,42 @@ interface GuestLoginPromptProps {
 
 export function GuestLoginPrompt({ delayMs = GUEST_PROMPT_DELAY_MS }: GuestLoginPromptProps) {
   const [open, setOpen] = useState(false);
+  const [closing, setClosing] = useState(false);
   const cardRef = useRef<HTMLDivElement | null>(null);
   const skipBtnRef = useRef<HTMLButtonElement | null>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
+  const closeTimerRef = useRef<number | undefined>(undefined);
 
   const dismissPrompt = useCallback(() => {
-    setOpen(false);
     const current = readGuestPromptState(window.sessionStorage);
     writeGuestPromptState(window.sessionStorage, {
       firstVisitAt: current.firstVisitAt,
       dismissed: true,
     });
-    if (previousFocusRef.current && typeof previousFocusRef.current.focus === 'function') {
-      window.requestAnimationFrame(() => previousFocusRef.current?.focus());
+    const prefersReducedMotion =
+      typeof window.matchMedia === 'function' &&
+      window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+    if (prefersReducedMotion) {
+      setOpen(false);
+      setClosing(false);
+      if (previousFocusRef.current && typeof previousFocusRef.current.focus === 'function') {
+        window.requestAnimationFrame(() => previousFocusRef.current?.focus());
+      }
+      return;
     }
+
+    setClosing(true);
+    if (closeTimerRef.current !== undefined) {
+      window.clearTimeout(closeTimerRef.current);
+    }
+    closeTimerRef.current = window.setTimeout(() => {
+      setOpen(false);
+      setClosing(false);
+      if (previousFocusRef.current && typeof previousFocusRef.current.focus === 'function') {
+        window.requestAnimationFrame(() => previousFocusRef.current?.focus());
+      }
+    }, 180);
   }, []);
 
   useEffect(() => {
@@ -79,6 +101,9 @@ export function GuestLoginPrompt({ delayMs = GUEST_PROMPT_DELAY_MS }: GuestLogin
     return () => {
       if (timerId !== undefined) {
         window.clearTimeout(timerId);
+      }
+      if (closeTimerRef.current !== undefined) {
+        window.clearTimeout(closeTimerRef.current);
       }
       channel?.close();
     };
@@ -127,7 +152,7 @@ export function GuestLoginPrompt({ delayMs = GUEST_PROMPT_DELAY_MS }: GuestLogin
 
   return (
     <div
-      className="modal-backdrop guest-prompt-backdrop"
+      className={`modal-backdrop guest-prompt-backdrop${closing ? ' is-closing' : ''}`}
       role="dialog"
       aria-modal="true"
       aria-labelledby="guest-login-prompt-title"
@@ -136,18 +161,21 @@ export function GuestLoginPrompt({ delayMs = GUEST_PROMPT_DELAY_MS }: GuestLogin
       <div
         ref={cardRef}
         onKeyDown={handleTrapTab}
-        className="modal-card guest-prompt-card"
+        className={`modal-card guest-prompt-card${closing ? ' is-closing' : ''}`}
       >
-        <div className="modal-head">
+        <div className="modal-head guest-prompt-head">
           <div className="guest-prompt-title-wrap">
             <span className="guest-prompt-icon" aria-hidden="true">
-              <BookmarkCheck size={18} />
+              <BookmarkCheck size={19} />
             </span>
-            <h2 id="guest-login-prompt-title">Want to save your learning progress?</h2>
+            <div>
+              <span className="guest-prompt-eyebrow">Optional Account</span>
+              <h2 id="guest-login-prompt-title">Want to save your learning progress?</h2>
+            </div>
           </div>
           <button
             type="button"
-            className="ws-icon-btn"
+            className="ws-icon-btn guest-prompt-close"
             onClick={dismissPrompt}
             aria-label="Close sign in reminder"
           >
@@ -158,6 +186,12 @@ export function GuestLoginPrompt({ delayMs = GUEST_PROMPT_DELAY_MS }: GuestLogin
         <p id="guest-login-prompt-desc" className="guest-prompt-desc">
           Sign in to save your learning history, track your progress, and continue where you left off on your next visit.
         </p>
+
+        <ul className="guest-prompt-perks" aria-label="Account benefits">
+          <li>Save favorite concepts</li>
+          <li>Keep recent lab history</li>
+          <li>Sync across devices</li>
+        </ul>
 
         <div className="guest-prompt-actions">
           <Link href="/login" className="primary-button guest-prompt-primary">
