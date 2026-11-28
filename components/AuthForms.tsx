@@ -122,6 +122,11 @@ export function LoginForm() {
           <span>Create an account</span>
         </Link>
       </div>
+      <div className="auth-guest-return">
+        <Link href="/" className="auth-link">
+          Continue learning as guest →
+        </Link>
+      </div>
       </form>
     </div>
   );
@@ -230,6 +235,11 @@ export function RegisterForm() {
         <span>Already have a Vistra account?</span>
         <Link href="/login" className="auth-link">
           <span>Sign in</span>
+        </Link>
+      </div>
+      <div className="auth-guest-return">
+        <Link href="/" className="auth-link">
+          Continue learning as guest →
         </Link>
       </div>
       </form>

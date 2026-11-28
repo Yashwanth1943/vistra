@@ -98,13 +98,14 @@ function applyUpdate(doc, update) {
 }
 
 function createInMemoryMongoDb() {
-  const store = { users: [], magicLinks: [], sessions: [], rateLimits: [], emailOtps: [] };
+  const store = { users: [], magicLinks: [], sessions: [], rateLimits: [], emailOtps: [], studentProgress: [] };
   const uniqueFields = {
     users: ['email', 'id'],
     magicLinks: ['tokenHash'],
     sessions: ['sessionTokenHash'],
     rateLimits: ['key'],
     emailOtps: ['id'],
+    studentProgress: ['userId'],
   };
 
   function makeCollection(name) {
@@ -1184,7 +1185,7 @@ test('login OTP responses are indistinguishable for existing vs unknown emails, 
   await registerUserAccount({ name: 'Known User', email: 'known@gmail.com' });
   sent.length = 0;
 
-  const t0 = Date.UTC(2026, 10, 27, 16, 20, 0);
+  const t0 = Date.now();
 
   // 1st request: both unknown and known return identical status & message
   const unk1 = await requestLoginOtp({ email: 'unknown@gmail.com', nowMs: t0 });
@@ -1301,4 +1302,256 @@ test('sanitizeAuthError captures DNS fields without exposing credentials, URIs, 
   assert.equal(cleaned.hostname, 'cluster0.abc12.mongodb.net');
   assert.equal(JSON.stringify(cleaned).includes('supersecret'), false);
   assert.equal(JSON.stringify(cleaned).includes('admin'), false);
+});
+
+const {
+  GUEST_PROMPT_DELAY_MS,
+  GUEST_PROMPT_STORAGE_KEY,
+  computeRemainingDelayMs,
+  readGuestPromptState,
+  writeGuestPromptState,
+} = require('../lib/guest-prompt.ts');
+
+test('guest login prompt timer persists across refreshes and stops after dismissal', () => {
+  const store = new Map();
+  const mockStorage = {
+    getItem: (k) => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => store.set(k, v),
+  };
+
+  const t0 = 1_700_000_000_000;
+  assert.equal(GUEST_PROMPT_DELAY_MS, 10 * 60 * 1000);
+
+  const initial = readGuestPromptState(mockStorage, t0);
+  assert.equal(initial.firstVisitAt, t0);
+  assert.equal(initial.dismissed, false);
+  writeGuestPromptState(mockStorage, initial);
+
+  // Refresh after 4 minutes: timer does not reset
+  const after4Min = readGuestPromptState(mockStorage, t0 + 4 * 60 * 1000);
+  assert.equal(after4Min.firstVisitAt, t0);
+  assert.equal(
+    computeRemainingDelayMs(after4Min, GUEST_PROMPT_DELAY_MS, t0 + 4 * 60 * 1000),
+    6 * 60 * 1000,
+  );
+
+  // At 10 minutes: remaining delay reaches 0
+  assert.equal(
+    computeRemainingDelayMs(after4Min, GUEST_PROMPT_DELAY_MS, t0 + 10 * 60 * 1000),
+    0,
+  );
+
+  // Dismissing persists and prevents popup from reappearing in session
+  writeGuestPromptState(mockStorage, { firstVisitAt: initial.firstVisitAt, dismissed: true });
+  const dismissedState = readGuestPromptState(mockStorage, t0 + 15 * 60 * 1000);
+  assert.equal(dismissedState.dismissed, true);
+  assert.equal(computeRemainingDelayMs(dismissedState, GUEST_PROMPT_DELAY_MS, t0 + 15 * 60 * 1000), null);
+  assert.ok(store.has(GUEST_PROMPT_STORAGE_KEY));
+});
+
+test('workspace API denies unauthenticated guests and scopes saved progress strictly to session.user.id', async () => {
+  const memDb = createInMemoryMongoDb();
+  setMongoDbForTests(memDb);
+
+  const { setCookieStoreForTests } = require('../lib/auth/session.ts');
+
+  const authResult = await authenticateWithGoogleProfile({
+    sub: 'google-progress-user',
+    email: 'progress@gmail.com',
+    emailVerified: true,
+    name: 'Progress Student',
+    picture: null,
+  });
+  assert.equal(authResult.ok, true);
+  const userId = authResult.user.id;
+
+  let activeCookieToken = null;
+  setCookieStoreForTests(async () => ({
+    get: (name) =>
+      name === 'vistra_session' && activeCookieToken
+        ? { value: activeCookieToken }
+        : undefined,
+  }));
+
+  try {
+    const workspaceRoute = require('../app/api/workspace/route.ts');
+
+    // Guest (no session cookie) is rejected with 401 on GET and PUT
+    const guestGet = await workspaceRoute.GET();
+    assert.equal(guestGet.status, 401);
+
+    const guestPut = await workspaceRoute.PUT(
+      new Request('https://vistra-learn.vercel.app/api/workspace', {
+        method: 'PUT',
+        headers: {
+          'content-type': 'application/json',
+          origin: 'https://vistra-learn.vercel.app',
+          'sec-fetch-site': 'same-origin',
+        },
+        body: JSON.stringify({ favorites: ['box-model'] }),
+      }),
+    );
+    assert.equal(guestPut.status, 401);
+
+    // Authenticated student saves progress; forged body userId is ignored
+    activeCookieToken = authResult.sessionToken;
+
+    const authPut = await workspaceRoute.PUT(
+      new Request('https://vistra-learn.vercel.app/api/workspace', {
+        method: 'PUT',
+        headers: {
+          'content-type': 'application/json',
+          origin: 'https://vistra-learn.vercel.app',
+          'sec-fetch-site': 'same-origin',
+        },
+        body: JSON.stringify({
+          userId: 'forged-other-user',
+          favorites: ['box-model', 'flex-direction'],
+          recent: ['justify'],
+          completed: ['semantic'],
+          lastLesson: 'box-model',
+          lastTab: 'Learn',
+        }),
+      }),
+    );
+    assert.equal(authPut.status, 200);
+    const putJson = await authPut.json();
+    assert.equal(putJson.ok, true);
+    assert.deepEqual(putJson.progress.favorites, ['box-model', 'flex-direction']);
+
+    // Cross-origin PUT is blocked
+    const crossOriginPut = await workspaceRoute.PUT(
+      new Request('https://vistra-learn.vercel.app/api/workspace', {
+        method: 'PUT',
+        headers: {
+          'content-type': 'application/json',
+          origin: 'https://evil.example',
+          'sec-fetch-site': 'cross-site',
+        },
+        body: JSON.stringify({ favorites: ['hacked'] }),
+      }),
+    );
+    assert.equal(crossOriginPut.status, 403);
+
+    // GET /api/workspace returns progress strictly under session.user.id
+    const authGet = await workspaceRoute.GET();
+    assert.equal(authGet.status, 200);
+    const getJson = await authGet.json();
+    assert.equal(getJson.workspace.userId, userId);
+    assert.deepEqual(getJson.workspace.progress.favorites, ['box-model', 'flex-direction']);
+    assert.deepEqual(getJson.workspace.progress.recent, ['justify']);
+    assert.equal(memDb.store.studentProgress.length, 1);
+    assert.equal(memDb.store.studentProgress[0].userId, userId);
+  } finally {
+    setCookieStoreForTests(null);
+  }
+});
+
+const {
+  fetchWorkspaceProgress,
+  resolvePutCompletion,
+  shouldPersistWorkspaceProgress,
+} = require('../lib/workspace-sync.ts');
+
+test('workspace hydration fails safely on 503 or network error and never triggers initial or unhydrated PUT', async () => {
+  const identityNormalize = (values) => (Array.isArray(values) ? values.map(String) : []);
+
+  // 1. Successful GET hydrates favorites and recent without marking dirty
+  const okResult = await fetchWorkspaceProgress(
+    async () =>
+      new Response(
+        JSON.stringify({
+          ok: true,
+          workspace: {
+            userId: 'u1',
+            progress: { favorites: ['box-model'], recent: ['justify'] },
+          },
+        }),
+        { status: 200 },
+      ),
+    identityNormalize,
+  );
+  assert.deepEqual(okResult, {
+    ok: true,
+    favorites: ['box-model'],
+    recent: ['justify'],
+  });
+  // Initial hydration does not trigger PUT (revision === savedRevision)
+  assert.equal(
+    shouldPersistWorkspaceProgress({ authenticated: true, hydrated: true, revision: 0, savedRevision: 0 }),
+    false,
+  );
+  // Actual user change after hydration triggers PUT
+  assert.equal(
+    shouldPersistWorkspaceProgress({ authenticated: true, hydrated: true, revision: 1, savedRevision: 0 }),
+    true,
+  );
+
+  // 2. Overlapping rapid PUTs keep status as 'saving' until the latest revision completes
+  const stalePutComplete = resolvePutCompletion({
+    ok: true,
+    targetRevision: 1,
+    latestRevision: 2,
+    currentSavedRevision: 0,
+  });
+  assert.deepEqual(stalePutComplete, {
+    nextSavedRevision: 1,
+    nextStatus: 'saving',
+    nextErrorSource: null,
+  });
+
+  const latestPutComplete = resolvePutCompletion({
+    ok: true,
+    targetRevision: 2,
+    latestRevision: 2,
+    currentSavedRevision: 1,
+  });
+  assert.deepEqual(latestPutComplete, {
+    nextSavedRevision: 2,
+    nextStatus: 'saved',
+    nextErrorSource: null,
+  });
+
+  // 3. Failed PUT preserves dirty state and reports save error
+  const failedPut = resolvePutCompletion({
+    ok: false,
+    targetRevision: 3,
+    latestRevision: 3,
+    currentSavedRevision: 2,
+  });
+  assert.deepEqual(failedPut, {
+    nextSavedRevision: 2,
+    nextStatus: 'error',
+    nextErrorSource: 'save',
+  });
+
+  // 4. HTTP 503 GET fails safely, marks retryable, and keeps hydrated=false so PUT never runs
+  const err503 = await fetchWorkspaceProgress(
+    async () => new Response(JSON.stringify({ ok: false }), { status: 503 }),
+    identityNormalize,
+  );
+  assert.deepEqual(err503, { ok: false, status: 503, retryable: true });
+  assert.equal(
+    shouldPersistWorkspaceProgress({ authenticated: true, hydrated: false, revision: 1, savedRevision: 0 }),
+    false,
+  );
+
+  // 5. Network failure fails safely without throwing and keeps hydrated=false
+  const netErr = await fetchWorkspaceProgress(async () => {
+    throw new Error('ECONNRESET');
+  }, identityNormalize);
+  assert.deepEqual(netErr, { ok: false, status: null, retryable: true });
+
+  // 6. Invalid payload fails safely and is non-retryable
+  const badPayload = await fetchWorkspaceProgress(
+    async () => new Response(JSON.stringify({ ok: true, workspace: {} }), { status: 200 }),
+    identityNormalize,
+  );
+  assert.deepEqual(badPayload, { ok: false, status: 200, retryable: false });
+
+  // 7. Guest users never persist progress
+  assert.equal(
+    shouldPersistWorkspaceProgress({ authenticated: false, hydrated: true, revision: 1, savedRevision: 0 }),
+    false,
+  );
 });

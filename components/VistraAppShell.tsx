@@ -1,12 +1,21 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import dynamic from 'next/dynamic';
+import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { ArrowRight, BookOpen, Braces, Check, ChevronDown, ChevronRight, CircleHelp, Clock, Code2, FolderKanban, LayoutDashboard, LogOut, Menu, MessageSquare, MonitorPlay, MousePointerClick, Search, ShieldCheck, Sliders, Sparkles, User, Wand2, X, Zap, Box, PanelsTopLeft, Smartphone, Hammer } from 'lucide-react';
+import { AlertCircle, ArrowRight, BookOpen, Braces, Check, ChevronDown, ChevronRight, CircleHelp, Clock, Code2, FolderKanban, LayoutDashboard, Loader2, LogIn, LogOut, Menu, MessageSquare, MonitorPlay, MousePointerClick, Search, ShieldCheck, Sliders, Sparkles, User, Wand2, X, Zap, Box, PanelsTopLeft, Smartphone, Hammer } from 'lucide-react';
 import { curriculum, topicGroup } from '../app/curriculum';
 import { trackLabVisit } from '../app/student-store';
 import { VistraLogo } from './VistraLogo';
+import { GUEST_AUTH_CHANNEL, GuestLoginPrompt } from './GuestLoginPrompt';
+import {
+  fetchWorkspaceProgress,
+  resolvePutCompletion,
+  shouldPersistWorkspaceProgress,
+  type WorkspaceSyncErrorSource,
+  type WorkspaceSyncStatus,
+} from '@/lib/workspace-sync';
 import { comparisons, buildExamples, type BuildExample } from '../app/learning-tools';
 
 const VisualizerSuite=dynamic(()=>import('./VisualizerSuite').then(module=>module.VisualizerSuite),{loading:()=> <p role="status">Loading visualizer…</p>});
@@ -60,7 +69,7 @@ const normalizeSavedIds = (values: unknown) => Array.isArray(values) ? [...new S
 
 function persistBrowserState(key:string,value:unknown){try{localStorage.setItem(key,JSON.stringify(value));}catch{/* Storage may be disabled or full; keep the in-memory session usable. */}}
 
-export function VistraAppShell({ currentUser }: { currentUser: AuthenticatedUserView }) {
+export function VistraAppShell({ currentUser }: { currentUser: AuthenticatedUserView | null }) {
   const router = useRouter();
   const [activeTab, setActiveTab] = useState('Overview');
   const [playgroundStarter,setPlaygroundStarter]=useState<BuildExample|undefined>(undefined);
@@ -75,6 +84,11 @@ export function VistraAppShell({ currentUser }: { currentUser: AuthenticatedUser
   const [completed] = useState<string[]>([]);
   const [favorites, setFavorites] = useState<string[]>([]);
   const [recent, setRecent] = useState<string[]>([]);
+  const [progressHydrated, setProgressHydrated] = useState(false);
+  const [syncStatus, setSyncStatus] = useState<WorkspaceSyncStatus>('loading');
+  const [syncErrorSource, setSyncErrorSource] = useState<WorkspaceSyncErrorSource>(null);
+  const [loadAttemptNonce, setLoadAttemptNonce] = useState(0);
+  const [saveAttemptNonce, setSaveAttemptNonce] = useState(0);
   const topbarSearchRef = useRef<HTMLInputElement>(null);
   const learnSearchRef = useRef<HTMLInputElement>(null);
   const menuToggleRef = useRef<HTMLButtonElement>(null);
@@ -83,8 +97,12 @@ export function VistraAppShell({ currentUser }: { currentUser: AuthenticatedUser
   const helpCloseRef = useRef<HTMLButtonElement>(null);
   const helpCardRef = useRef<HTMLDivElement>(null);
   const accountMenuRef = useRef<HTMLDivElement>(null);
+  const progressRevisionRef = useRef(0);
+  const savedRevisionRef = useRef(0);
 
-  const userInitial = (currentUser.name.trim()[0] || currentUser.email[0] || 'V').toUpperCase();
+  const userInitial = currentUser
+    ? (currentUser.name.trim()[0] || currentUser.email[0] || 'V').toUpperCase()
+    : 'G';
 
   const trapModalTab = (e: React.KeyboardEvent, container: HTMLElement | null) => {
     if (e.key !== 'Tab' || !container) return;
@@ -102,7 +120,143 @@ export function VistraAppShell({ currentUser }: { currentUser: AuthenticatedUser
       first.focus();
     }
   };
-  useEffect(() => { try { const savedFavorites = normalizeSavedIds(JSON.parse(localStorage.getItem('webcraft:favorites') || '[]')); const savedRecent = normalizeSavedIds(JSON.parse(localStorage.getItem('webcraft:recent') || '[]')).slice(0, 6); setFavorites(savedFavorites); setRecent(savedRecent); persistBrowserState('webcraft:favorites',savedFavorites); persistBrowserState('webcraft:recent',savedRecent); } catch { /* Ignore invalid saved browser data. */ } }, []);
+  useEffect(() => {
+    if (!currentUser) {
+      return;
+    }
+
+    if (typeof BroadcastChannel !== 'undefined') {
+      const channel = new BroadcastChannel(GUEST_AUTH_CHANNEL);
+      channel.postMessage({ type: 'authenticated' });
+      channel.close();
+    }
+
+    let cancelled = false;
+    let retryTimer: number | undefined;
+    const maxRetries = 2;
+
+    setSyncStatus('loading');
+    setSyncErrorSource(null);
+
+    const hydrateWorkspace = async (attempt: number) => {
+      const result = await fetchWorkspaceProgress(fetch, normalizeSavedIds);
+      if (cancelled) return;
+
+      if (result.ok) {
+        if (progressRevisionRef.current === 0) {
+          setFavorites(result.favorites);
+          setRecent(result.recent);
+        }
+        setProgressHydrated(true);
+        if (progressRevisionRef.current > savedRevisionRef.current) {
+          setSyncStatus('saving');
+        } else {
+          setSyncStatus('saved');
+        }
+        setSyncErrorSource(null);
+        return;
+      }
+
+      if (result.retryable && attempt < maxRetries) {
+        const delayMs = 2000 * (attempt + 1);
+        retryTimer = window.setTimeout(() => {
+          void hydrateWorkspace(attempt + 1);
+        }, delayMs);
+        return;
+      }
+
+      setSyncStatus('error');
+      setSyncErrorSource('load');
+    };
+
+    void hydrateWorkspace(0);
+
+    return () => {
+      cancelled = true;
+      if (retryTimer !== undefined) {
+        window.clearTimeout(retryTimer);
+      }
+    };
+  }, [currentUser, loadAttemptNonce]);
+
+  useEffect(() => {
+    if (
+      !shouldPersistWorkspaceProgress({
+        authenticated: Boolean(currentUser),
+        hydrated: progressHydrated,
+        revision: progressRevisionRef.current,
+        savedRevision: savedRevisionRef.current,
+      })
+    ) {
+      return;
+    }
+
+    let cancelled = false;
+    const targetRevision = progressRevisionRef.current;
+    setSyncStatus('saving');
+    setSyncErrorSource(null);
+
+    const timer = window.setTimeout(() => {
+      fetch('/api/workspace', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          favorites,
+          recent,
+          completed,
+          lastLesson: activeLesson,
+          lastTab: activeTab,
+        }),
+      })
+        .then(async (res) => {
+          let payloadOk = false;
+          if (res.ok) {
+            try {
+              const json = (await res.json()) as { ok?: unknown };
+              payloadOk = json?.ok === true;
+            } catch {
+              payloadOk = false;
+            }
+          }
+          if (cancelled) return;
+          const resolution = resolvePutCompletion({
+            ok: res.ok && payloadOk,
+            targetRevision,
+            latestRevision: progressRevisionRef.current,
+            currentSavedRevision: savedRevisionRef.current,
+          });
+          savedRevisionRef.current = resolution.nextSavedRevision;
+          setSyncStatus(resolution.nextStatus);
+          setSyncErrorSource(resolution.nextErrorSource);
+        })
+        .catch(() => {
+          if (cancelled) return;
+          const resolution = resolvePutCompletion({
+            ok: false,
+            targetRevision,
+            latestRevision: progressRevisionRef.current,
+            currentSavedRevision: savedRevisionRef.current,
+          });
+          savedRevisionRef.current = resolution.nextSavedRevision;
+          setSyncStatus(resolution.nextStatus);
+          setSyncErrorSource(resolution.nextErrorSource);
+        });
+    }, 300);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [currentUser, progressHydrated, favorites, recent, completed, activeLesson, activeTab, saveAttemptNonce]);
+
+  const handleRetryWorkspaceSync = useCallback(() => {
+    if (!currentUser) return;
+    if (syncErrorSource === 'load' && !progressHydrated) {
+      setLoadAttemptNonce((n) => n + 1);
+      return;
+    }
+    setSaveAttemptNonce((n) => n + 1);
+  }, [currentUser, syncErrorSource, progressHydrated]);
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
@@ -186,8 +340,8 @@ export function VistraAppShell({ currentUser }: { currentUser: AuthenticatedUser
   useEffect(() => {
     trackLabVisit(activeTab);
   }, [activeTab]);
-  const selectLesson = (id:string) => { setActiveLesson(id); setActiveTab('Learn'); setShowMobileNav(false); setRecent(previous => { const next = [id, ...previous.filter(item => item !== id)].slice(0, 6); persistBrowserState('webcraft:recent',next); return next; }); };
-  const toggleFavorite = (id:string) => setFavorites(previous => { const next = previous.includes(id) ? previous.filter(item => item !== id) : [...previous, id]; persistBrowserState('webcraft:favorites',next); return next; });
+  const selectLesson = (id:string) => { progressRevisionRef.current += 1; setActiveLesson(id); setActiveTab('Learn'); setShowMobileNav(false); setRecent(previous => { const next = [id, ...previous.filter(item => item !== id)].slice(0, 6); if (currentUser) persistBrowserState('webcraft:recent', next); return next; }); };
+  const toggleFavorite = (id:string) => { progressRevisionRef.current += 1; setFavorites(previous => { const next = previous.includes(id) ? previous.filter(item => item !== id) : [...previous, id]; if (currentUser) persistBrowserState('webcraft:favorites', next); return next; }); };
 
   return <div className="app-shell">
     <a href="#main-content" className="skip-link">Skip to main content</a>
@@ -212,42 +366,90 @@ export function VistraAppShell({ currentUser }: { currentUser: AuthenticatedUser
         </nav>
         {hiddenNav.map(item => <button key={item.name} style={{display:'none'}} className={`nav-item ${activeTab===item.name?'active':''}`} onClick={()=>{setActiveTab(item.name);setShowMobileNav(false)}}><item.icon size={15}/><span>{item.name}</span></button>)}
       </div>
-      <div className="sidebar-bottom"><div className="mentor-avatar mentor-avatar--vistra"><VistraLogo variant="icon" size={16} decorative/></div><div className="sidebar-bottom-info"><strong>{currentUser.name}</strong><span>{currentUser.email}</span></div><ChevronDown size={14} className="muted-icon"/></div>
+      {currentUser ? (
+        <div className="sidebar-bottom"><div className="mentor-avatar mentor-avatar--vistra"><VistraLogo variant="icon" size={16} decorative/></div><div className="sidebar-bottom-info"><strong>{currentUser.name}</strong><span>{currentUser.email}</span></div><ChevronDown size={14} className="muted-icon"/></div>
+      ) : (
+        <Link href="/login" className="sidebar-bottom sidebar-bottom--guest"><div className="mentor-avatar mentor-avatar--vistra"><VistraLogo variant="icon" size={16} decorative/></div><div className="sidebar-bottom-info"><strong>Guest mode</strong><span>Sign in to save progress</span></div><ArrowRight size={14} className="muted-icon"/></Link>
+      )}
     </aside>
     {showMobileNav&&<button className="scrim" onClick={()=>setShowMobileNav(false)} aria-label="Close navigation"/>}
     <main id="main-content" tabIndex={-1} className="main-area">
-      <header className="topbar"><div className="topbar-left"><button ref={menuToggleRef} className="menu-toggle" onClick={()=>setShowMobileNav(true)} aria-label="Open menu" aria-expanded={showMobileNav}><Menu size={20}/></button><button type="button" className="mobile-brand-button" onClick={()=>setActiveTab('Overview')} aria-label="Vistra home"><VistraLogo variant="compact" size={24} decorative/></button><button className="breadcrumb" onClick={()=>setActiveTab('Overview')}>Explore</button><label className="global-search"><Search size={14}/><input ref={topbarSearchRef} value={query} onFocus={()=>setActiveTab('Learn')} onChange={e=>{setQuery(e.target.value);setActiveTab('Learn')}} placeholder="Search concepts" aria-label="Search concepts"/><kbd>⌘ K</kbd></label><ChevronRight size={14}/><span className="breadcrumb-current">{activeTabLabel}</span></div><div className="topbar-right"><button ref={feedbackBtnRef} type="button" className="reset-button" onClick={()=>setShowFeedback(true)} aria-label="Send lab feedback"><MessageSquare size={13}/><span>Feedback</span></button><div className="streak"><Zap size={15}/><span>Keep learning</span></div><button ref={helpBtnRef} className="help-button" onClick={()=>setShowHelp(true)} title="Keyboard shortcuts and help" aria-label="Keyboard shortcuts and help" aria-expanded={showHelp}><CircleHelp size={18}/></button>
-        <div className="account-menu-wrap" ref={accountMenuRef}>
-          <button
-            type="button"
-            className="user-avatar-btn"
-            onClick={() => setShowAccountMenu(prev => !prev)}
-            aria-label="Account menu"
-            aria-expanded={showAccountMenu}
-            aria-haspopup="menu"
+      <header className="topbar"><div className="topbar-left"><button ref={menuToggleRef} className="menu-toggle" onClick={()=>setShowMobileNav(true)} aria-label="Open menu" aria-expanded={showMobileNav}><Menu size={20}/></button><button type="button" className="mobile-brand-button" onClick={()=>setActiveTab('Overview')} aria-label="Vistra home"><VistraLogo variant="compact" size={24} decorative/></button><button className="breadcrumb" onClick={()=>setActiveTab('Overview')}>Explore</button><label className="global-search"><Search size={14}/><input ref={topbarSearchRef} value={query} onFocus={()=>setActiveTab('Learn')} onChange={e=>{setQuery(e.target.value);setActiveTab('Learn')}} placeholder="Search concepts" aria-label="Search concepts"/><kbd>⌘ K</kbd></label><ChevronRight size={14}/><span className="breadcrumb-current">{activeTabLabel}</span></div><div className="topbar-right">
+        {currentUser ? (
+          <div
+            className={`workspace-sync-pill workspace-sync-pill--${syncStatus}`}
+            role="status"
+            aria-live="polite"
+            data-sync-status={syncStatus}
           >
-            <span className="user-avatar" aria-hidden="true">{userInitial}</span>
-          </button>
-          {showAccountMenu && (
-            <div className="account-menu" role="menu" aria-label="User account">
-              <div className="account-menu-header">
-                <div className="account-menu-name"><User size={14} aria-hidden="true"/><span>{currentUser.name}</span></div>
-                <div className="account-menu-email">{currentUser.email}</div>
-                <div className="account-menu-role"><ShieldCheck size={12} aria-hidden="true"/><span>{currentUser.role}</span></div>
-              </div>
+            {syncStatus === 'loading' || syncStatus === 'saving' ? (
+              <Loader2 size={13} className="workspace-sync-spin" aria-hidden="true" />
+            ) : syncStatus === 'error' ? (
+              <AlertCircle size={13} aria-hidden="true" />
+            ) : (
+              <Check size={13} aria-hidden="true" />
+            )}
+            <span>
+              {syncStatus === 'loading'
+                ? 'Loading progress…'
+                : syncStatus === 'saving'
+                  ? 'Saving…'
+                  : syncStatus === 'error'
+                    ? syncErrorSource === 'load'
+                      ? "Couldn't load progress"
+                      : "Couldn't save progress"
+                    : 'Saved'}
+            </span>
+            {syncStatus === 'error' ? (
               <button
                 type="button"
-                role="menuitem"
-                className="account-menu-logout"
-                onClick={handleLogout}
-                disabled={signingOut}
+                className="workspace-sync-retry"
+                onClick={handleRetryWorkspaceSync}
               >
-                <LogOut size={14} aria-hidden="true"/>
-                <span>{signingOut ? 'Signing out…' : 'Sign out'}</span>
+                Retry
               </button>
-            </div>
-          )}
-        </div>
+            ) : null}
+          </div>
+        ) : null}
+        <button ref={feedbackBtnRef} type="button" className="reset-button" onClick={()=>setShowFeedback(true)} aria-label="Send lab feedback"><MessageSquare size={13}/><span>Feedback</span></button><div className="streak"><Zap size={15}/><span>Keep learning</span></div><button ref={helpBtnRef} className="help-button" onClick={()=>setShowHelp(true)} title="Keyboard shortcuts and help" aria-label="Keyboard shortcuts and help" aria-expanded={showHelp}><CircleHelp size={18}/></button>
+        {currentUser ? (
+          <div className="account-menu-wrap" ref={accountMenuRef}>
+            <button
+              type="button"
+              className="user-avatar-btn"
+              onClick={() => setShowAccountMenu(prev => !prev)}
+              aria-label="Account menu"
+              aria-expanded={showAccountMenu}
+              aria-haspopup="menu"
+            >
+              <span className="user-avatar" aria-hidden="true">{userInitial}</span>
+            </button>
+            {showAccountMenu && (
+              <div className="account-menu" role="menu" aria-label="User account">
+                <div className="account-menu-header">
+                  <div className="account-menu-name"><User size={14} aria-hidden="true"/><span>{currentUser.name}</span></div>
+                  <div className="account-menu-email">{currentUser.email}</div>
+                  <div className="account-menu-role"><ShieldCheck size={12} aria-hidden="true"/><span>{currentUser.role}</span></div>
+                </div>
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="account-menu-logout"
+                  onClick={handleLogout}
+                  disabled={signingOut}
+                >
+                  <LogOut size={14} aria-hidden="true"/>
+                  <span>{signingOut ? 'Signing out…' : 'Sign out'}</span>
+                </button>
+              </div>
+            )}
+          </div>
+        ) : (
+          <Link href="/login" className="guest-signin-btn">
+            <LogIn size={14} aria-hidden="true"/>
+            <span>Sign in</span>
+          </Link>
+        )}
       </div></header>
       <div className="content-wrap">
         {activeTab==='HTML Playground'?<HtmlPlaygroundLab onOpenCodePlayground={()=>setActiveTab('Playground')}/>:null}
@@ -279,6 +481,7 @@ export function VistraAppShell({ currentUser }: { currentUser: AuthenticatedUser
       <footer className="footer"><span>Made for curious minds.</span><span>Vistra <span className="footer-dot">·</span> Learn by building</span></footer>
     </main>
     {showFeedback&&<FeedbackModal activeLab={activeTab} onClose={()=>{setShowFeedback(false);window.requestAnimationFrame(()=>feedbackBtnRef.current?.focus());}}/>}
+    {!currentUser && <GuestLoginPrompt />}
     {showHelp&&<div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="help-modal-title"><div ref={helpCardRef} onKeyDown={(e)=>trapModalTab(e,helpCardRef.current)} className="modal-card"><div className="modal-head"><h2 id="help-modal-title"><CircleHelp size={16}/> Keyboard Shortcuts</h2><button ref={helpCloseRef} type="button" className="ws-icon-btn" onClick={()=>{setShowHelp(false);window.requestAnimationFrame(()=>helpBtnRef.current?.focus());}} aria-label="Close help dialog"><X size={16}/></button></div><div className="modal-shortcuts"><div><kbd>Ctrl / ⌘ + K</kbd><span>Focus concept search</span></div><div><kbd>Ctrl / ⌘ + Enter</kbd><span>Run preview</span></div><div><kbd>Shift + Alt + F</kbd><span>Format HTML &amp; CSS</span></div><div><kbd>Ctrl / ⌘ + S</kbd><span>Save or export</span></div><div><kbd>Ctrl + M</kbd><span>Switch editor pane</span></div><div><kbd>Esc</kbd><span>Close dialog or menu</span></div></div><div className="modal-actions"><button type="button" className="primary-button" onClick={()=>{setShowHelp(false);window.requestAnimationFrame(()=>helpBtnRef.current?.focus());}}>Got it</button></div></div></div>}
   </div>;
 }

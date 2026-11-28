@@ -35,8 +35,16 @@ export function clearSessionCookie(response: NextResponse): void {
   });
 }
 
+let testCookieReader: (() => Promise<{ get: (name: string) => { value: string } | undefined }>) | null = null;
+
+export function setCookieStoreForTests(
+  reader: (() => Promise<{ get: (name: string) => { value: string } | undefined }>) | null,
+): void {
+  testCookieReader = reader;
+}
+
 export async function getServerSession(): Promise<ValidatedSession | null> {
-  const cookieStore = await cookies();
+  const cookieStore = testCookieReader ? await testCookieReader() : await cookies();
   const rawToken = cookieStore.get(SESSION_COOKIE_NAME)?.value;
   return validateSessionToken(rawToken);
 }

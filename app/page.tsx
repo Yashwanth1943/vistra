@@ -13,18 +13,15 @@ export default async function HomePage() {
       )}`,
     );
   }
-  if (result.status !== 'authenticated') {
-    redirect('/login');
-  }
+  const currentUser =
+    result.status === 'authenticated'
+      ? {
+          id: result.session.user.id,
+          name: result.session.user.name,
+          email: result.session.user.email,
+          role: result.session.user.role,
+        }
+      : null;
 
-  return (
-    <VistraAppShell
-      currentUser={{
-        id: result.session.user.id,
-        name: result.session.user.name,
-        email: result.session.user.email,
-        role: result.session.user.role,
-      }}
-    />
-  );
+  return <VistraAppShell currentUser={currentUser} />;
 }
